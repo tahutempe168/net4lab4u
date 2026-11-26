@@ -44,6 +44,7 @@ if [[ "${NOVA_VE_SKIP_DEMO_IMAGES:-0}" == "1" ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+bash "${REPO_ROOT}/deploy/scripts/publish-acr-images.sh" --check
 
 # Marker namespace must match app.services.docker_image_service.MARKER_NAMESPACE.
 MARKER_NS="nova-ve-lab"
@@ -128,5 +129,9 @@ build_demo_image "nova-ve/alpine-vnc:latest"    "${REPO_ROOT}/deploy/demo-images
 mark_for_lab "alpine:3.22"
 mark_for_lab "nova-ve/alpine-telnet:latest"
 mark_for_lab "nova-ve/alpine-vnc:latest"
+
+bash "${REPO_ROOT}/deploy/scripts/publish-acr-images.sh" \
+  "alpine:3.22|nova-ve/runtime/alpine" \
+  nova-ve/alpine-telnet:latest nova-ve/alpine-vnc:latest
 
 echo "build-demo-images: done." >&2

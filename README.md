@@ -69,6 +69,73 @@ After install, open `http://<host>/` and log in with the admin credentials repor
 
 For development workflows (running the backend with `--reload`, the frontend dev server, or a Rancher Desktop loop on macOS), see the [Deployment contract](docs/development/deployment-contract.md) and the helper scripts in [`deploy/scripts/`](deploy/scripts/).
 
+## Build and publish Docker images to Azure ACR
+
+ACR publishing is optional. From the checkout, authenticate as an identity
+authorized to push to your registry, then run:
+
+```bash
+az login
+az acr login --name <registry-resource-name>
+export NOVA_VE_ACR_REGISTRY=<registry-login-server>
+bash deploy/scripts/build-all-images.sh
+```
+
+Use the registry's actual login server (for example `myregistry.azurecr.io`),
+not a URL. Run Azure login and the build scripts as the same OS user.
+Scripts read exported environment variables; they do not source `.env`.
+Without `NOVA_VE_ACR_REGISTRY`, builds still run but nothing is pushed.
+
+This builds all eight repository Dockerfiles, including the Ubuntu desktop
+demo, and pulls the runtime images used by the Compose stacks. Only after
+everything succeeds does it check every source image, create local ACR-qualified
+tags, and push them. Every ACR destination uses `:latest`; upstream base/runtime
+versions remain pinned except `guacamole/guacd` and `guacamole/guacamole`,
+which also use upstream `:latest`. Unrelated images on the Docker host are never published.
+Original local tags and lab catalog markers remain available.
+
+Application/demo/platform repositories retain their `nova-ve/` names.
+Guacamole images retain `guacamole/guacd` and `guacamole/guacamole`.
+Runtime variants use separate repositories to avoid overwriting each other:
+
+- `alpine:3.22` becomes `nova-ve/runtime/alpine:latest`.
+- `alpine:3.21` becomes `nova-ve/runtime/alpine-sandbox:latest`.
+- `postgres:16-alpine` becomes `nova-ve/runtime/postgres-alpine:latest`.
+- `postgres:16` becomes `nova-ve/runtime/postgres:latest`.
+
+To retry publication without rebuilding, run
+`bash deploy/scripts/publish-acr-images.sh`. A missing source, failed build,
+pull, tag or push exits nonzero. Registry pushes are not atomic: a failed push
+can leave earlier images published, so retry after fixing the failure.
+
+The existing `build-demo-images.sh` and `build-platform-images.sh` helpers
+publish their own images after completion when ACR is configured. Platform
+`pull`/`auto` mode uses ACR instead of GHCR; ACR publication takes precedence
+over `GHCR_PUSH`. The installer remains a host deployment, not the build-all
+publishing command. Compose still uses the original local/runtime references;
+publishing alone does not change running deployments.
+
+### GitHub Actions and credentials
+
+The container workflow builds all images and verifies platform containers
+before publishing on `main`. Configure these GitHub repository **variables**:
+`NOVA_VE_ACR_REGISTRY`, `AZURE_ACR_NAME`, `AZURE_CLIENT_ID`,
+`AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID`. Configure an Azure federated
+credential for this repository's `main` branch and grant the identity
+registry-scoped push access (`AcrPush`, or the appropriate repository writer
+role for an ABAC-enabled registry). With no registry variable, CI only builds
+and verifies; it does not publish to ACR or GHCR.
+
+Azure OIDC avoids stored registry passwords. Local publishing reuses Docker's
+existing authentication; use an OS credential helper for Docker and never
+commit access tokens, passwords or credential files. Inject application
+secrets at runtime from a secret manager such as Azure Key Vault or a protected
+runtime secret mount, not Docker build arguments or image layers. Backend and
+frontend build contexts exclude local environment and credential files.
+
+Run the isolated, mocked-Docker checks with
+`bash deploy/scripts/test-acr-images.sh`.
+
 ## Project Structure
 
 ```

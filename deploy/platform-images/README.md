@@ -3,6 +3,12 @@
 Run `deploy/scripts/build-platform-images.sh` from the checkout to build the
 images and add them to Nova VE's lab image catalog.
 
+Optionally export `NOVA_VE_ACR_REGISTRY` to your ACR login server and authenticate
+with `az acr login` before building. All three images are built before their
+ACR-qualified `:latest` tags are created and pushed. Pull/auto mode uses ACR
+when configured. See the root [README](../../README.md#build-and-publish-docker-images-to-azure-acr)
+for the build-all command and password-free CI setup.
+
 - **Browser Station** (`nova-ve/browser:latest`) provides Firefox, an Openbox
   desktop, a taskbar, a terminal, and the Nova VE wallpaper. Existing nodes
   can keep their VNC console. Choose RDP on the node to use a desktop that

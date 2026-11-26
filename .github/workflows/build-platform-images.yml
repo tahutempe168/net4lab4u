@@ -1,4 +1,4 @@
-name: Platform container images
+name: Container images
 
 on:
   push:
@@ -6,78 +6,79 @@ on:
       - main
     paths:
       - 'deploy/platform-images/**'
-      - 'deploy/scripts/verify-platform-images.sh'
+      - 'deploy/demo-images/**'
+      - 'deploy/scripts/*images*.sh'
+      - 'deploy/compose/**'
+      - 'backend/**'
+      - 'frontend/**'
+      - 'docker-compose.yml'
       - '.github/workflows/build-platform-images.yml'
   pull_request:
     paths:
       - 'deploy/platform-images/**'
-      - 'deploy/scripts/verify-platform-images.sh'
+      - 'deploy/demo-images/**'
+      - 'deploy/scripts/*images*.sh'
+      - 'deploy/compose/**'
+      - 'backend/**'
+      - 'frontend/**'
+      - 'docker-compose.yml'
       - '.github/workflows/build-platform-images.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - kind: mgmt-server
-            context: deploy/platform-images/mgmt-server
-            dockerfile: deploy/platform-images/mgmt-server/Dockerfile
-          - kind: browser
-            context: deploy/platform-images
-            dockerfile: deploy/platform-images/browser/Dockerfile
-          - kind: desktop
-            context: deploy/platform-images
-            dockerfile: deploy/platform-images/desktop/Dockerfile
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NOVA_VE_ACR_REGISTRY: ${{ vars.NOVA_VE_ACR_REGISTRY }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build ${{ matrix.kind }}
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
-          load: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/nova-ve-${{ matrix.kind }}:latest
-            ghcr.io/${{ github.repository_owner }}/nova-ve-${{ matrix.kind }}:${{ github.sha }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=Nova VE ${{ matrix.kind }} platform container
+      - name: Test publication scripts and validate registry
+        run: |
+          bash deploy/scripts/test-acr-images.sh
+          bash deploy/scripts/publish-acr-images.sh --check
 
-      - name: Boot and verify ${{ matrix.kind }}
+      - name: Build all images without publishing
+        run: NOVA_VE_ACR_REGISTRY= bash deploy/scripts/build-all-images.sh
+
+      - name: Boot and verify platform images
         shell: bash
-        env:
-          KIND: ${{ matrix.kind }}
-          IMAGE: ghcr.io/${{ github.repository_owner }}/nova-ve-${{ matrix.kind }}:latest
         run: |
-          docker run -d --name platform-image "$IMAGE"
           trap 'docker logs platform-image; docker rm -f platform-image' EXIT
-          for _ in {1..15}; do
-            if deploy/scripts/verify-platform-images.sh "$KIND" platform-image; then
-              exit 0
-            fi
-            sleep 2
+          for kind in mgmt-server browser desktop; do
+            docker run -d --name platform-image "nova-ve/$kind:latest"
+            verified=0
+            for _ in {1..15}; do
+              if bash deploy/scripts/verify-platform-images.sh "$kind" platform-image; then
+                verified=1
+                break
+              fi
+              sleep 2
+            done
+            [[ "$verified" == "1" ]] || exit 1
+            docker rm -f platform-image
           done
-          exit 1
+          trap - EXIT
 
-      - name: Log in to GHCR
-        if: github.ref == 'refs/heads/main'
-        uses: docker/login-action@v3
+      - name: Log in to Azure using OIDC
+        if: github.ref == 'refs/heads/main' && vars.NOVA_VE_ACR_REGISTRY != ''
+        uses: azure/login@v2
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Publish tested image
-        if: github.ref == 'refs/heads/main'
+      - name: Log in to ACR and publish tested images
+        if: github.ref == 'refs/heads/main' && vars.NOVA_VE_ACR_REGISTRY != ''
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/nova-ve-${{ matrix.kind }}
+          ACR_NAME: ${{ vars.AZURE_ACR_NAME }}
         run: |
-          docker push "$IMAGE:$GITHUB_SHA"
-          docker push "$IMAGE:latest"
+          : "${ACR_NAME:?Set the AZURE_ACR_NAME repository variable}"
+          az acr login --name "$ACR_NAME"
+          bash deploy/scripts/publish-acr-images.sh

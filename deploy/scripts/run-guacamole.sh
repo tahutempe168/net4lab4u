@@ -159,7 +159,7 @@ if ! wait_for_postgres "${guacdb_container}" 120; then
 fi
 
 if [[ "$(docker exec "${guacdb_container}" psql -U guacuser -d guacdb -Atqc "select to_regclass('public.guacamole_entity')")" != "guacamole_entity" ]]; then
-  docker run --rm guacamole/guacamole:1.6.0 /opt/guacamole/bin/initdb.sh --postgresql > "${schema_file}"
+  docker run --rm guacamole/guacamole:latest /opt/guacamole/bin/initdb.sh --postgresql > "${schema_file}"
   docker cp "${schema_file}" "${guacdb_container}":/tmp/guacdb.sql
   docker exec -i "${guacdb_container}" \
     psql -U guacuser -d guacdb -v ON_ERROR_STOP=1 -f /tmp/guacdb.sql >/dev/null

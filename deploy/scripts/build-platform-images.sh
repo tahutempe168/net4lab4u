@@ -35,6 +35,9 @@
 #   GHCR_PUSH=1                     Also tag+push the images to GHCR
 #                                   (requires docker login ghcr.io with
 #                                   write:packages).
+#   NOVA_VE_ACR_REGISTRY            Optional ACR login server. Pull from ACR
+#                                   instead of GHCR and publish after all
+#                                   images are ready, using existing Docker auth.
 #
 # Idempotency: images rebuild from the checked-out repo so stale local tags
 # do not mask fixes; marker tags refresh when the source image id changes.
@@ -48,6 +51,7 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PLATFORM_DIR="${REPO_ROOT}/deploy/platform-images"
+bash "${REPO_ROOT}/deploy/scripts/publish-acr-images.sh" --check
 
 GHCR_OWNER="${GHCR_OWNER:-fahadysf}"
 MARKER_NS="nova-ve-lab"
@@ -100,9 +104,13 @@ build_platform_image() {
 pull_platform_image() {
   local local_tag="$1"
   local ghcr_name="$2"
-  echo "build-platform-images: pulling ghcr.io/${GHCR_OWNER}/${ghcr_name}:latest -> ${local_tag}" >&2
-  docker pull "ghcr.io/${GHCR_OWNER}/${ghcr_name}:latest"
-  docker tag "ghcr.io/${GHCR_OWNER}/${ghcr_name}:latest" "${local_tag}"
+  local reference="ghcr.io/${GHCR_OWNER}/${ghcr_name}:latest"
+  if [[ -n "${NOVA_VE_ACR_REGISTRY:-}" ]]; then
+    reference="${NOVA_VE_ACR_REGISTRY}/${local_tag}"
+  fi
+  echo "build-platform-images: pulling ${reference} -> ${local_tag}" >&2
+  docker pull "$reference" || return $?
+  docker tag "$reference" "${local_tag}"
 }
 
 push_ghcr() {
@@ -162,9 +170,16 @@ for pair in "${IMAGES[@]}"; do
   IFS='|' read -r local_tag ghcr_name image_dir <<< "$pair"
   ensure_platform_image "$local_tag" "$ghcr_name" "$image_dir"
   mark_for_lab "$local_tag"
-  if [[ "${GHCR_PUSH:-0}" == "1" ]]; then
-    push_ghcr "$local_tag" "$ghcr_name"
-  fi
 done
+
+if [[ -n "${NOVA_VE_ACR_REGISTRY:-}" ]]; then
+  bash "${REPO_ROOT}/deploy/scripts/publish-acr-images.sh" \
+    nova-ve/mgmt-server:latest nova-ve/browser:latest nova-ve/desktop:latest
+elif [[ "${GHCR_PUSH:-0}" == "1" ]]; then
+  for pair in "${IMAGES[@]}"; do
+    IFS='|' read -r local_tag ghcr_name image_dir <<< "$pair"
+    push_ghcr "$local_tag" "$ghcr_name"
+  done
+fi
 
 echo "build-platform-images: done." >&2

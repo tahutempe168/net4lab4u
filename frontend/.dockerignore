@@ -3,3 +3,9 @@
 node_modules
 test-results
 build
+**/.env*
+**/.credentials
+**/secrets
+**/.npmrc
+**/*.pem
+**/*.key
