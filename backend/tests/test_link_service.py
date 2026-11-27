@@ -64,6 +64,14 @@ def link_settings(tmp_path, monkeypatch):
     monkeypatch.setattr("app.services.link_service.get_settings", lambda: settings)
     monkeypatch.setattr("app.services.network_service.get_settings", lambda: settings)
     monkeypatch.setattr("app.services.node_runtime_service.get_settings", lambda: settings)
+    # Tests in this module do not use a real Docker daemon.
+    monkeypatch.setattr(
+        "app.services.node_runtime_service.NodeRuntimeService.docker_network_state",
+        lambda self, lab_id, node_id, container_name=None: (
+            {"container_name": container_name or "test", "network_mode": "none"}
+            if self._runtime_record(lab_id, node_id) else None
+        ),
+    )
     return settings
 
 
@@ -469,7 +477,7 @@ async def test_create_link_calls_set_qemu_nic_link_up_for_running_qemu(
         return {"kind": "qemu", "lab_id": "lab", "node_id": 1}
 
     def fake_attach_qemu(
-        self, _lab_id, node_id, network_id, interface_index, *, bridge_name=None
+        self, _lab_id, node_id, network_id, interface_index, *, bridge_name=None, _lab_lock_held=False
     ):
         return {"interface_index": interface_index, "attach_generation": 1}
 

@@ -167,6 +167,54 @@ async def test_delete_lab_cleans_nat_cloud_runtime(monkeypatch, patched_settings
 
 
 @pytest.mark.asyncio
+async def test_delete_lab_wipes_node_work_dirs(monkeypatch, patched_settings):
+    # #338: lab delete must remove every node's disks/data, like node delete.
+    from app.services.node_runtime_service import NodeRuntimeService
+
+    db = FakeDB()
+    service = LabService(db)
+    lab_path = patched_settings.LABS_DIR / "wipe-nodes.json"
+    lab_path.write_text(
+        """{
+            "schema": 2,
+            "id": "lab-wipe-nodes",
+            "meta": {"name": "wipe-nodes"},
+            "nodes": {"1": {"name": "r1"}, "2": {"name": "r2"}},
+            "links": [],
+            "networks": {}
+        }"""
+    )
+    work_root = patched_settings.TMP_DIR / "lab-wipe-nodes"
+    for node_id in ("1", "2", "99"):
+        overlay = work_root / node_id / "virtioa.qcow2"
+        overlay.parent.mkdir(parents=True, exist_ok=True)
+        overlay.write_text("disk")
+    runtime_dir = patched_settings.TMP_DIR / "node-runtime"
+    runtime_dir.mkdir(exist_ok=True)
+    stale_record = runtime_dir / "lab-wipe-nodes-1.json"
+    stale_record.write_text('{"lab_id": "lab-wipe-nodes", "node_id": 1, "kind": "qemu"}')
+
+    stopped: list[int] = []
+
+    def fake_stop(self, lab_data, node_id, *, confirm_stopped):
+        assert confirm_stopped
+        stopped.append(node_id)
+        self._delete_runtime(lab_data["id"], node_id)
+
+    monkeypatch.setattr(NodeRuntimeService, "stop_node", fake_stop)
+
+    lab = SimpleNamespace(filename="wipe-nodes.json")
+    await service.delete_lab(lab)
+
+    assert stopped == [1, 2]
+    assert not work_root.exists()
+    assert not stale_record.exists()
+    assert not lab_path.exists()
+    assert db.deleted == [lab]
+    assert db.commit_count == 1
+
+
+@pytest.mark.asyncio
 async def test_lab_router_supports_node_network_and_topology_mutations(patched_settings):
     lab_path = patched_settings.LABS_DIR / "nested" / "lab.json"
     _write_lab(
@@ -211,7 +259,7 @@ cpulimit: 1
         current_user=current_user,
     )
     assert create_node_response["code"] == 200
-    assert create_node_response["data"]["interfaces"][0]["name"] == "Gi1"
+    assert create_node_response["data"]["interfaces"][0]["name"] == "eth0"
 
     update_node_response = await labs.update_node(
         "nested/lab.json",

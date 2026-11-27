@@ -50,12 +50,14 @@
   import LinkEdge from '$lib/components/canvas/LinkEdge.svelte';
   import LinkPreview from '$lib/components/canvas/LinkPreview.svelte';
   import LinkConfirmModal from '$lib/components/canvas/LinkConfirmModal.svelte';
+  import DeleteConfirmDialog from '$lib/components/DeleteConfirmDialog.svelte';
   import NetworkConfigModal from '$lib/components/canvas/NetworkConfigModal.svelte';
   import PortInfoPopover from '$lib/components/canvas/PortInfoPopover.svelte';
   import { selectedPortInfoStore, type SelectedPortInfo } from '$lib/stores/portInfo';
   import { canvasPrefs } from '$lib/stores/canvasPrefs';
   import { infoPanels } from '$lib/stores/infoPanels';
   import { networkSharing, type NetworkModalType } from '$lib/services/networkSharing';
+  import { FRAME_WIDTH, FRAME_ROW_LIMIT, networkFrameHeight, networkFrameRows, frameFits, frameRowPosition } from '$lib/services/networkFrame';
   import {
     dhcpEnabled,
     dhcpToggle,
@@ -80,7 +82,7 @@
   } from '$lib/services/portLayout';
   import type { Obstacle } from '$lib/services/router';
   import { createWsClient, type WsClient, type WsMessage } from '$lib/services/wsClient';
-  import { labState } from '$lib/stores/labState';
+  import { labState, type LabEditorState } from '$lib/stores/labState';
   import { createLabWsStores, type LabWsStores, type LinkChangeEvent } from '$lib/stores/labWs';
   import { deriveEdges, attachRouteObstacles, parseIfaceInterfaceIndex, slotPosition, type DiscoveredLink } from '$lib/services/canvasEdges';
   import { createdFromLinkResponse, type LinkCreateResponse } from '$lib/services/linkCreate';
@@ -177,6 +179,7 @@
     // links[] without a full loadLab(). Cascade deletes (e.g. orphan
     // implicit-bridge halves) deliver one event per link_id.
     'link-change': LinkChangeEvent;
+    'snapshot-needed': void;
   }>();
 
   const nodeTypes = {
@@ -186,27 +189,41 @@
   const edgeTypes = {
     link: LinkEdge
   } as unknown as Record<string, never>;
-  const { fitView, screenToFlowPosition, zoomIn, zoomOut } = useSvelteFlow();
+  const defaultEdgeOptions = { type: 'default' };
+  const proOptions = { hideAttribution: true };
+  const { fitView, screenToFlowPosition, zoomIn, zoomOut, getViewport } = useSvelteFlow();
 
   // #248: every mutating endpoint response carries the post-write lab
   // revision; adopting it keeps the If-Match token fresh without a reload,
   // so single-session edits no longer spuriously 412 on the next write.
-  function adoptRevision(response: unknown): void {
+  function adoptRevision(response: unknown): boolean {
+    if (canvasDestroyed || ($labState.labId && $labState.labId !== labId)) return false;
     const revision = (response as { revision?: unknown } | null)?.revision;
     if (typeof revision === 'number') {
+      if ($labState.revision !== null && revision < $labState.revision) {
+        dispatch('snapshot-needed');
+        return false;
+      }
       labState.setRevision(revision);
     }
+    return true;
   }
+
+  let layoutRevision: number | null = null;
+  $: if (!canvasDestroyed && $labState.labId === labId) layoutRevision = $labState.revision;
 
   const layoutDebouncer: LayoutDebouncer = createLayoutDebouncer(labId, {
     delayMs: 500,
     // #245: guard writes with the store's revision; the response carries the
     // post-write revision so the next write is checked against fresh state.
-    versionProvider: () => $labState.revision,
+    versionProvider: () => layoutRevision,
     onApplied: (result) => {
-      adoptRevision(result);
+      const revision = (result as { revision?: unknown } | null)?.revision;
+      if (typeof revision === 'number') layoutRevision = Math.max(layoutRevision ?? revision, revision);
+      if (!canvasDestroyed && $labState.labId === labId) adoptRevision(result);
     },
     onError: (err) => {
+      if (canvasDestroyed || $labState.labId !== labId) return;
       if (err instanceof LayoutConflictError) {
         // The payload requeued; the page re-adopts the server snapshot
         // (keeping our pending positions) and retries the flush with the
@@ -227,6 +244,14 @@
   };
   const NODE_CARD_HEIGHT = 58;
   const NETWORK_CARD_HEIGHT = 50;
+  let requestedFrameId: number | null = null;
+  let activeFrameBox: NodeBox | null = null;
+  let frameZoomHigh = true;
+  let frameLabId = labId;
+  $: if (frameLabId !== labId) {
+    frameLabId = labId;
+    requestedFrameId = null;
+  }
   let topologyChangeBanner:
     | {
         message: string;
@@ -319,8 +344,6 @@
   const nodesStore = writable<Node[]>([]);
   const edgesStore = writable<Edge[]>([]);
 
-  let saveTimer: ReturnType<typeof setTimeout> | null = null;
-  let saveState: 'idle' | 'saving' | 'saved' = 'idle';
   let selectedEdgeId: string | null = null;
   let paletteLoading = true;
   let paletteItems: PaletteItem[] = [];
@@ -365,6 +388,9 @@
       }
     | null = null;
   let portMenuTarget: ConnectionPointTarget | null = null;
+  /** Node awaiting delete confirmation (#338); no DELETE is sent until confirmed. */
+  let nodeDeleteConfirm: { id: number; name: string } | null = null;
+  let nodeDeleteBusy = false;
 
   // #268 — the node the context menu currently targets. The Console entry
   // renders one pill per available console mode from this node's config.
@@ -563,6 +589,14 @@
   // N-1 remainder, and edges are left untouched.
   const HOVER_CLEAR_GRACE_MS = 120;
   let hoverFocusId: string | null = null;
+  let focusedId: string | null = null;
+  let focusLabId = labId;
+  $: if (focusLabId !== labId) {
+    focusLabId = labId;
+    focusedId = null;
+    hoverFocusId = null;
+    publishFlowState();
+  }
   // Rapid pointer crossings fire mouseleave on the old node BEFORE
   // mouseenter on the new one; clearing focus synchronously on leave
   // would flash everything to full opacity between the two events
@@ -620,32 +654,76 @@
     return focusNodes;
   }
 
+  let lastProjectedLab: LabEditorState | undefined;
+  let projectionDeferred = false;
+
   function publishFlowState() {
+    if (activeNodeDrag) {
+      projectionDeferred = true;
+      return;
+    }
+    if (requestedFrameId !== null && frameRows(requestedFrameId).length === 0) requestedFrameId = null;
+    // Compute the expanded obstacle once per projection, not once per edge.
+    activeFrameBox = requestedFrameId !== null && frameZoomHigh && frameHasSpace(requestedFrameId)
+      ? frameCandidate(requestedFrameId)
+      : null;
     const builtNodes = buildFlowNodes();
     const builtEdges = buildFlowEdges();
+    if (focusedId && !builtNodes.some((node) => node.id === focusedId)) {
+      focusedId = null;
+    }
+    const focusedNodes = focusedId ? computeHoverFocus(focusedId, builtEdges) : null;
+    const focusedNetworks = new Set(
+      focusedId
+        ? builtEdges
+            .filter((edge) => edge.source === focusedId || edge.target === focusedId)
+            .flatMap((edge) => [edge.source, edge.target])
+            .filter((id) => id.startsWith('network'))
+        : []
+    );
     // A stale hover target (node removed while hovered) must not light
     // ghosts — focus only applies to nodes that still render.
     const focusNodes =
       hoverFocusId && builtNodes.some((node) => node.id === hoverFocusId)
         ? computeHoverFocus(hoverFocusId, builtEdges)
         : null;
-    nodesStore.set(
-      focusNodes
-        ? builtNodes.map((node) =>
-            focusNodes.has(node.id)
-              ? { ...node, class: `${node.class ? `${node.class} ` : ''}nv-focus-pulse` }
-              : node
-          )
-        : builtNodes
-    );
-    edgesStore.set(builtEdges);
+    nodesStore.set(builtNodes.map((node) => {
+      const classes = [node.class];
+      if (focusNodes?.has(node.id)) classes.push('nv-focus-pulse');
+      if (focusedNodes && !focusedNodes.has(node.id)) classes.push('nv-focus-dimmed');
+      return classes.filter(Boolean).length ? { ...node, class: classes.filter(Boolean).join(' ') } : node;
+    }));
+    edgesStore.set(builtEdges.map((edge) => {
+      const onPath = edge.source === focusedId || edge.target === focusedId ||
+        focusedNetworks.has(edge.source) || focusedNetworks.has(edge.target);
+      return focusedId && !onPath
+        ? { ...edge, class: `${edge.class ? `${edge.class} ` : ''}nv-focus-dimmed` }
+        : edge;
+    }));
+    lastProjectedLab = $labState;
+    projectionDeferred = false;
   }
 
-  // #245: the canvas is a pure view of the shared labState store. Any store
-  // change — canvas mutations, loadLab snapshots, WS-driven updates —
-  // repaints the flow elements. The old props/lastXRef identity-diff sync
-  // and its local deep clones are gone.
-  $: if ($labState) publishFlowState();
+  function setExplicitFocus(targetId: string | null) {
+    focusedId = targetId;
+    closeMenu();
+    publishFlowState();
+  }
+
+  function projectLabChanges(state: LabEditorState, dragging: boolean) {
+    if (dragging) return;
+    if (
+      projectionDeferred ||
+      lastProjectedLab?.nodes !== state.nodes ||
+      lastProjectedLab.networks !== state.networks ||
+      lastProjectedLab.links !== state.links ||
+      lastProjectedLab.defaults !== state.defaults
+    ) {
+      publishFlowState();
+    }
+  }
+
+  $: projectLabChanges($labState, !!activeNodeDrag);
 
   $: networkPaletteItems = paletteItems.filter(
     (item): item is PaletteNetworkItem => item.kind === 'network'
@@ -658,7 +736,51 @@
   }
 
   function networkCardWidth(network: NetworkData): number {
-    return network.width ? network.width + 40 : 130;
+    const compactWidth = network.width ? network.width + 40 : 130;
+    return frameIsExpanded(network.id) ? Math.max(FRAME_WIDTH, compactWidth) : compactWidth;
+  }
+
+  function frameRows(networkId: number) {
+    return networkFrameRows(networkId, $labState.links, $labState.nodes);
+  }
+
+  function frameCandidate(networkId: number): NodeBox | null {
+    const network = $labState.networks[String(networkId)];
+    if (!network) return null;
+    return { x: network.left || 100, y: network.top || 100, w: Math.max(FRAME_WIDTH, network.width ? network.width + 40 : 130), h: networkFrameHeight(frameRows(networkId).length) };
+  }
+
+  function frameHasSpace(networkId: number): boolean {
+    const candidate = frameCandidate(networkId);
+    if (!candidate) return false;
+    const others: NodeBox[] = [];
+    for (const node of Object.values($labState.nodes)) {
+      const box = nodeBox(node.id);
+      if (box) others.push(box);
+    }
+    for (const network of Object.values($labState.networks)) {
+      if (network.id === networkId || !network.visibility) continue;
+      others.push({ x: network.left || 100, y: network.top || 100, w: network.width ? network.width + 40 : 130, h: NETWORK_CARD_HEIGHT });
+    }
+    return frameFits(candidate, others);
+  }
+
+  function frameIsExpanded(networkId: number): boolean {
+    return requestedFrameId === networkId && activeFrameBox !== null;
+  }
+
+  function toggleNetworkFrame(networkId: number) {
+    const currentViewport = getViewport?.();
+    if (currentViewport) frameZoomHigh = currentViewport.zoom >= 0.85;
+    if (requestedFrameId === networkId) {
+      requestedFrameId = null;
+    } else if (!frameHasSpace(networkId)) {
+      toastStore.push('Not enough space to show network connections. Move nearby items or open network info.', 'info');
+      return;
+    } else {
+      requestedFrameId = networkId;
+    }
+    publishFlowState();
   }
 
   function nodeBox(nodeId: number): NodeBox | null {
@@ -679,7 +801,7 @@
       x: network.left || 100,
       y: network.top || 100,
       w: networkCardWidth(network),
-      h: NETWORK_CARD_HEIGHT,
+      h: frameIsExpanded(networkId) ? networkFrameHeight(frameRows(networkId).length) : NETWORK_CARD_HEIGHT,
     };
   }
 
@@ -826,7 +948,15 @@
 
     for (const [networkId, positions] of network.entries()) {
       const box = networkBox(networkId);
-      if (box) network.set(networkId, separatePositionRecord(positions, box));
+      if (box) {
+        const adjusted = separatePositionRecord(positions, box);
+        if (frameIsExpanded(networkId)) {
+          frameRows(networkId).slice(0, FRAME_ROW_LIMIT).forEach((row, index) => {
+            adjusted[row.linkId] = frameRowPosition(index, box.h, row.peerX !== null && row.peerX > box.x + box.w / 2 ? 'right' : 'left');
+          });
+        }
+        network.set(networkId, adjusted);
+      }
     }
 
     // Dotted "new connection" handles (#258): the open slot obeys the same
@@ -910,6 +1040,12 @@
     });
   }
 
+  function handleCardLifecycle(nodeId: number, action: LabNodeAction) {
+    const current = $labState.nodes[String(nodeId)];
+    if (!current || !isEligibleForLabAction(current, action)) return;
+    void handleNodeAction(action, `node${nodeId}`);
+  }
+
   function buildFlowNodes(): Node[] {
     const flowNodes: Node[] = [];
     const connectionPointPositions = buildConnectionPointPositions();
@@ -923,6 +1059,7 @@
           label: node.name,
           status: node.status,
           transientStatus: node.transientStatus,
+          onLifecycleAction: handleCardLifecycle,
           type: node.type,
           template: node.template,
           console: node.console,
@@ -975,6 +1112,10 @@
           portPositionsByLinkId: connectionPointPositions.network.get(network.id) ?? {},
           portRefsByLinkId: connectionPointPositions.networkRefs.get(network.id) ?? {},
           openSlotPosition: connectionPointPositions.networkOpenSlot.get(network.id) ?? null,
+          frameRows: frameRows(network.id),
+          frameExpanded: frameIsExpanded(network.id),
+          frameRequested: requestedFrameId === network.id,
+          toggleFrame: () => toggleNetworkFrame(network.id),
           brokenImplicit: isBrokenImplicit
         },
         style: `width: ${networkCardWidth(network)}px;`
@@ -1114,16 +1255,19 @@
   async function handleZoomIn() {
     if (canvasLocked) return;
     await zoomIn({ duration: 120 });
+    syncFrameZoom(getViewport?.());
   }
 
   async function handleZoomOut() {
     if (canvasLocked) return;
     await zoomOut({ duration: 120 });
+    syncFrameZoom(getViewport?.());
   }
 
   async function handleFitView() {
     if (canvasLocked) return;
     await fitView({ duration: 180, padding: 0.2 });
+    syncFrameZoom(getViewport?.());
   }
 
   function eventPoint(event: MouseEvent | TouchEvent): { x: number; y: number } {
@@ -1152,52 +1296,6 @@
       paletteLoading = false;
     }
   });
-
-  function scheduleSave() {
-    if (saveTimer) {
-      clearTimeout(saveTimer);
-    }
-
-    saveState = 'saving';
-    saveTimer = setTimeout(async () => {
-      try {
-        const expected = $labState.revision;
-        const result = await apiRequest<{ revision?: number }>(`/labs/${labId}/topology`, {
-          method: 'PUT',
-          headers:
-            expected !== null && expected !== undefined
-              ? { 'If-Match': String(expected) }
-              : undefined,
-          // Topology-only payload. Node/network deletion is already
-          // persisted by DELETE /nodes/{id} and DELETE /networks/{id}
-          // (both filter topology[] server-side). Echoing full
-          // $labState.nodes/$labState.networks here re-sent positions captured
-          // before a racing loadLab() reload, reverting layout saves
-          // that PUT /layout had already persisted. Positions travel
-          // exclusively via layoutDebouncer → PUT /layout.
-          body: {
-            topology: $labState.topology
-          }
-        });
-        if (typeof result?.revision === 'number') {
-          labState.setRevision(result.revision);
-        }
-        saveState = 'saved';
-      } catch (error) {
-        if (error instanceof ApiError && error.statusCode === 412) {
-          // #245: lab changed elsewhere. Surface it and let the page
-          // re-adopt the server snapshot, then retry the (queued) layout
-          // flush; the topology payload itself is re-sent by the next
-          // mutation, so no retry here.
-          saveState = 'idle';
-          toastStore.push('Lab changed in another session — reloading latest state.', 'error');
-          dispatchCanvasChange('layout-conflict');
-          return;
-        }
-        saveState = 'idle';
-      }
-    }, 500);
-  }
 
   function decodeId(elementId: string): { type: 'node' | 'network'; id: number } | null {
     if (elementId.startsWith('node')) {
@@ -1232,7 +1330,25 @@
     labState.setNetworks(nextNetworks);
   }
 
+  let activeNodeDrag: Promise<void> | undefined;
+  let resolveNodeDrag: (() => void) | undefined;
+
+  function beginNodeDrag() {
+    activeNodeDrag ??= new Promise<void>((resolve) => { resolveNodeDrag = resolve; });
+  }
+
+  function finishNodeDrag() {
+    activeNodeDrag = undefined;
+    resolveNodeDrag?.();
+    resolveNodeDrag = undefined;
+  }
+
+  export async function waitForNodeDrag() {
+    while (activeNodeDrag) await activeNodeDrag;
+  }
+
   function handleNodeDragStop(event: CustomEvent<{ targetNode: Node | null }>) {
+    finishNodeDrag();
     const movedNode = event.detail.targetNode;
     if (!movedNode) {
       return;
@@ -1266,9 +1382,18 @@
     }
   }
 
-  function handleViewportEnd(event: CustomEvent<LabViewport>) {
-    const viewport = event.detail;
+  function syncFrameZoom(viewport: LabViewport | undefined) {
     if (!viewport) return;
+    const nextZoomHigh = frameZoomHigh ? viewport.zoom > 0.75 : viewport.zoom >= 0.85;
+    if (nextZoomHigh !== frameZoomHigh) {
+      frameZoomHigh = nextZoomHigh;
+      if (requestedFrameId !== null) publishFlowState();
+    }
+  }
+
+  function handleViewportEnd(viewport: LabViewport) {
+    if (!viewport) return;
+    syncFrameZoom(viewport);
     layoutDebouncer.pushViewport(viewport);
   }
 
@@ -1340,11 +1465,11 @@
         body: { from: fromEndpoint, to: toEndpoint },
         suppressToast: true,
       });
+      if (!adoptRevision(response)) return;
       const created = createdFromLinkResponse(response);
       if (created.link) {
         labState.applyCreatedLink(created.link, created.network);
       }
-      adoptRevision(response);
       // Optimistically remove the discovered overlay immediately (HIGH-1).
       // The next discovery cycle would also clear it, but removing it now
       // avoids a duplicate amber+gray edge flash while the cycle completes.
@@ -1376,12 +1501,6 @@
     const linksToDelete = indexes
       .map((index) => $labState.links[index])
       .filter((link): link is Link => !!link?.id);
-    // Capture pre-mutation snapshot for rollback on API failure.
-    const previousLinks = $labState.links;
-    const previousNodes = $labState.nodes;
-    const previousNetworks = $labState.networks;
-    const previousTopology = $labState.topology;
-
     for (const v2Link of linksToDelete) {
       if (
         typeof v2Link.from?.node_id === 'number' &&
@@ -1430,13 +1549,8 @@
       );
       responses.forEach(adoptRevision);
     } catch (error) {
-      labState.setLinks(previousLinks);
-      labState.setNodes(previousNodes);
-      labState.setNetworks(previousNetworks);
-      labState.setTopology(previousTopology);
-      publishFlowState();
-      dispatchCanvasChange('topology', {
-      });
+      if (canvasDestroyed || $labState.labId !== labId) return;
+      dispatch('snapshot-needed');
       const message =
         error instanceof ApiError
           ? error.message
@@ -1457,7 +1571,6 @@
       .filter((link): link is Link => !!link?.id);
     if (targets.length === 0) return;
 
-    const previousStyles = new Map(targets.map((link) => [link.id, link.style_override ?? null]));
     labState.setLinks($labState.links.map((link, i) =>
       updateIndexes.has(i) ? { ...link, style_override: style } : link
     ));
@@ -1480,10 +1593,8 @@
       );
       responses.forEach(adoptRevision);
     } catch (error) {
-      labState.setLinks($labState.links.map((link, i) =>
-        updateIndexes.has(i) ? { ...link, style_override: previousStyles.get(link.id) ?? null } : link
-      ));
-      publishFlowState();
+      if (canvasDestroyed || $labState.labId !== labId) return;
+      dispatch('snapshot-needed');
       const message = error instanceof Error ? error.message : 'Failed to update link style';
       toastStore.push(message, 'error');
     }
@@ -1605,24 +1716,36 @@
     }
 
     if (action === 'delete') {
-      const response = await apiRequest(`/labs/${labId}/nodes/${decoded.id}`, { method: 'DELETE' });
-      adoptRevision(response);
-      const nextNodes = { ...$labState.nodes };
-      delete nextNodes[String(decoded.id)];
-      labState.setNodes(nextNodes);
-      labState.setTopology($labState.topology.filter(
-        (link) => link.source !== `node${decoded.id}` && link.destination !== `node${decoded.id}`
-      ));
-      recalculateNetworks();
-      publishFlowState();
-      scheduleSave();
-      dispatchCanvasChange('node-delete', {
-        nodeId: decoded.id,
-      });
+      // #338: confirm first — the backend deletes disks/data immediately.
+      nodeDeleteConfirm = { id: decoded.id, name: node.name || `node ${decoded.id}` };
       return;
     }
 
     await runNodeLifecycle(action, node);
+  }
+
+  async function confirmNodeDelete() {
+    if (!nodeDeleteConfirm || nodeDeleteBusy) return;
+    const nodeId = nodeDeleteConfirm.id;
+    nodeDeleteBusy = true;
+    try {
+      const response = await apiRequest(`/labs/${labId}/nodes/${nodeId}`, { method: 'DELETE' });
+      if (!adoptRevision(response)) return;
+      const nextNodes = { ...$labState.nodes };
+      delete nextNodes[String(nodeId)];
+      labState.setNodes(nextNodes);
+      labState.setTopology(
+        $labState.topology.filter(
+          (link) => link.source !== `node${nodeId}` && link.destination !== `node${nodeId}`
+        )
+      );
+      recalculateNetworks();
+      publishFlowState();
+      dispatchCanvasChange('node-delete', { nodeId });
+      nodeDeleteConfirm = null;
+    } finally {
+      nodeDeleteBusy = false;
+    }
   }
 
   function handleEditNode(targetId: string) {
@@ -1637,6 +1760,12 @@
     }
   }
 
+  function handleNodeInfo(targetId: string) {
+    closeMenu();
+    const decoded = decodeId(targetId);
+    if (decoded?.type === 'node') infoPanels.open('node', decoded.id);
+  }
+
   async function handleNetworkSharing(targetId: string, shared: boolean) {
     closeMenu();
     const decoded = decodeId(targetId);
@@ -1648,7 +1777,7 @@
         method: 'PUT',
         body: { shared }
       });
-      adoptRevision(response);
+      if (!adoptRevision(response)) return;
       const updated = (response as unknown as { network: NetworkData }).network;
       const current = $labState.networks[String(decoded.id)];
       if (current) {
@@ -1672,7 +1801,7 @@
     }
 
     const response = await apiRequest(`/labs/${labId}/networks/${decoded.id}`, { method: 'DELETE' });
-    adoptRevision(response);
+    if (!adoptRevision(response)) return;
     const nextNetworks = { ...$labState.networks };
     delete nextNetworks[String(decoded.id)];
     labState.setNetworks(nextNetworks);
@@ -1686,7 +1815,6 @@
     }
     labState.setNodes({ ...$labState.nodes });
     publishFlowState();
-    scheduleSave();
     dispatchCanvasChange('network-delete', {
     });
   }
@@ -1719,7 +1847,7 @@
     // single-record envelope chosen for write routes. List routes still use
     // ``data:``; ApiResponse<T>.data is therefore unset here.
     const created = (response as unknown as { network: NetworkData }).network;
-    adoptRevision(response);
+    if (!adoptRevision(response)) return;
     labState.setNetworks({
       ...$labState.networks,
       [String(created.id)]: created
@@ -1829,7 +1957,7 @@
         suppressToast: true
       });
       const updated = (response as unknown as { network: NetworkData }).network;
-      adoptRevision(response);
+      if (!adoptRevision(response)) return;
       labState.setNetworks({ ...$labState.networks, [String(updated.id)]: updated });
       publishFlowState();
       // The lease and second-server notes are longer, so they stay up longer.
@@ -1885,7 +2013,7 @@
         suppressToast: true
       });
       const updated = (response as unknown as { network: NetworkData }).network;
-      adoptRevision(response);
+      if (!adoptRevision(response)) return;
       labState.setNetworks({ ...$labState.networks, [String(updated.id)]: updated });
       publishFlowState();
       toastStore.push(networkSavedMessage(network, updated, detail.config), 'success');
@@ -1995,6 +2123,8 @@
     if (snap.state !== 'idle') {
       dragLinkStore.cancel();
       dragLinkSourceAnchor = null;
+    } else if (focusedId) {
+      setExplicitFocus(null);
     }
   }
 
@@ -2090,7 +2220,7 @@
         suppressToast: true,
       });
       const created = createdFromLinkResponse(response);
-      adoptRevision(response);
+      if (!adoptRevision(response)) return;
 
       // The lab can only be patched in place from a complete result. A
       // node-to-node link is stored as an implicit bridge with two halves, but
@@ -2153,8 +2283,15 @@
       const client = createWsClient({ labId });
       wsClient = client;
       labWsStores = createLabWsStores(client);
+      for (const event of [
+        'hello', 'force_resnapshot', 'lab_topology', 'layout_updated', 'node_created',
+        'nodes_created', 'node_updated', 'node_deleted', 'network_created',
+        'network_updated', 'network_deleted', 'network_promoted', 'interface_updated',
+        'link_created', 'link_updated', 'link_deleted', 'link_patched', 'topology_updated'
+      ]) {
+        client.on(event, () => dispatch('snapshot-needed'));
+      }
       client.on('lab_topology', (_msg: WsMessage) => {
-        void layoutDebouncer.flush();
         // lab_topology resets the reconciliation store (done inside labWs);
         // republish edges so overlays clear from the canvas immediately.
         publishFlowState();
@@ -2212,6 +2349,7 @@
 
   onDestroy(() => {
     canvasDestroyed = true;
+    finishNodeDrag();
     clearTopologyChangeBanner();
   });
 
@@ -2273,7 +2411,7 @@
             console: NodeData['console'];
             second_console: NonNullable<NodeData['secondConsole']> | null;
             delay: number;
-            extras: Record<string, unknown>;
+            extras?: Record<string, unknown>;
           };
         }
     >
@@ -2289,12 +2427,16 @@
             top: Math.round(nodeCreateAnchor.y),
           }
         });
+        if (!adoptRevision(response)) {
+          nodeModalOpen = false;
+          nodeModalNode = null;
+          return;
+        }
         const nextNodes = { ...$labState.nodes };
         for (const node of response.data.nodes) {
           nextNodes[String(node.id)] = node;
         }
         labState.setNodes(nextNodes);
-        adoptRevision(response);
         publishFlowState();
         dispatchCanvasChange('node-create', {
         });
@@ -2320,11 +2462,15 @@
           method: 'PUT',
           body: event.detail.payload,
         });
+        if (!adoptRevision(response)) {
+          nodeModalOpen = false;
+          nodeModalNode = null;
+          return;
+        }
         labState.setNodes({
           ...$labState.nodes,
           [String(response.data.id)]: response.data,
         });
-        adoptRevision(response);
         publishFlowState();
         dispatchCanvasChange('node-edit', {
           nodeId: response.data.id,
@@ -2363,10 +2509,12 @@
     selectionOnDrag={!canvasLocked}
     autoPanOnConnect={!canvasLocked}
     autoPanOnNodeDrag={!canvasLocked}
-    defaultEdgeOptions={{ type: 'default' }}
-    proOptions={{ hideAttribution: true }}
+    {defaultEdgeOptions}
+    {proOptions}
+    on:nodedragstart={beginNodeDrag}
     on:nodedragstop={handleNodeDragStop}
-    on:moveend={(event: CustomEvent<LabViewport>) => handleViewportEnd(event)}
+    onMoveEnd={(_event, viewport) => handleViewportEnd(viewport)}
+    on:moveend={(event: CustomEvent<LabViewport>) => handleViewportEnd(event.detail)}
     on:edgeclick={(event: CustomEvent<{ edge: Edge }>) => {
       selectedEdgeId = event.detail.edge.id;
       closeMenu();
@@ -2454,13 +2602,12 @@
     {/if}
 
     <Panel position="top-left">
-      <div class="rounded-full border border-gray-800 bg-gray-900/95 px-3 py-1.5 text-[10px] uppercase tracking-[0.05em] text-gray-500 shadow-lg shadow-black/20">
-        {#if saveState === 'saving'}
-          Saving topology…
-        {:else if saveState === 'saved'}
-          Topology saved
-        {:else}
-          Topology editor
+      <div class="flex items-center gap-2 rounded-full border border-gray-800 bg-gray-900/95 px-3 py-1.5 text-[10px] uppercase tracking-[0.05em] text-gray-500 shadow-lg shadow-black/20">
+        Topology editor
+        {#if focusedId}
+          <button type="button" data-testid="exit-focus" class="rounded border border-blue-500/50 px-2 py-0.5 text-blue-200 hover:text-white" on:click={() => setExplicitFocus(null)}>
+            Exit focus
+          </button>
         {/if}
       </div>
     </Panel>
@@ -2773,6 +2920,12 @@
         {menu.targetType === 'node' ? 'Node actions' : menu.targetType === 'network' ? 'Network actions' : menu.targetType === 'port' ? 'Connection point' : 'Link actions'}
       </div>
       {#if menu?.targetType === 'node'}
+        <button type="button" class="menu-item" data-testid="node-menu-focus" on:click|preventDefault|stopPropagation={() => setExplicitFocus(menu?.targetId ?? null)}>
+          <span>Focus</span><LocateFixed class="h-3.5 w-3.5 text-gray-400" aria-hidden="true" />
+        </button>
+        <button type="button" class="menu-item" data-testid="node-menu-info" on:click|preventDefault|stopPropagation={() => handleNodeInfo(menu?.targetId ?? '')}>
+          <span>Node Info</span><Info class="h-3.5 w-3.5 text-gray-400" aria-hidden="true" />
+        </button>
         <button type="button" class="menu-item" on:click|preventDefault|stopPropagation={() => handleNodeAction('start', menu?.targetId ?? '')}>
           <span>Start</span><Play class="h-3.5 w-3.5 text-gray-400" />
         </button>
@@ -2830,6 +2983,9 @@
           <span>Delete Node</span><Trash2 class="h-3.5 w-3.5 text-red-200/80" />
         </button>
       {:else if menu?.targetType === 'network'}
+        <button type="button" class="menu-item" data-testid="network-menu-focus" on:click|preventDefault|stopPropagation={() => setExplicitFocus(menu?.targetId ?? null)}>
+          <span>Focus</span><LocateFixed class="h-3.5 w-3.5 text-gray-400" aria-hidden="true" />
+        </button>
         <button
           type="button"
           class="menu-item"
@@ -2999,6 +3155,17 @@
       on:cancel={handleLinkConfirmCancel}
     />
   </div>
+  {#if nodeDeleteConfirm}
+    <DeleteConfirmDialog
+      title={`Delete node "${nodeDeleteConfirm.name}"?`}
+      message="Its disks and data will be deleted immediately and may not be recoverable."
+      confirmLabel="Delete node"
+      busy={nodeDeleteBusy}
+      testId="node-delete-confirm"
+      on:confirm={confirmNodeDelete}
+      on:cancel={() => (nodeDeleteConfirm = null)}
+    />
+  {/if}
   <div hidden={hideNetworkModal} inert={hideNetworkModal}>
     <NetworkConfigModal
       {labId}
@@ -3154,6 +3321,12 @@
     outline: 2px solid #c0c0c0;
     outline-offset: 2px;
     animation: nv-focus-pulse 2s ease-in-out infinite;
+  }
+
+  :global(.svelte-flow__node.nv-focus-dimmed),
+  :global(.svelte-flow__edge.nv-focus-dimmed) {
+    opacity: 0.2;
+    transition: opacity 150ms;
   }
 
   :global(.canvas-minimap svg) {

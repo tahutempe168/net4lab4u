@@ -36,11 +36,17 @@ import fcntl
 import ipaddress
 import json
 import os
+import pwd
 import re
+import secrets
+import select
+import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -63,8 +69,20 @@ PROC_ROOT = Path(os.environ.get("NOVA_VE_PROC_ROOT", "/proc"))
 IP_BIN = os.environ.get("NOVA_VE_IP_BIN") or "ip"
 NSENTER_BIN = os.environ.get("NOVA_VE_NSENTER_BIN") or "nsenter"
 NFT_BIN = os.environ.get("NOVA_VE_NFT_BIN") or "nft"
-DNSMASQ_BIN = os.environ.get("NOVA_VE_DNSMASQ_BIN") or "dnsmasq"
+DNSMASQ_BIN = os.environ.get("NOVA_VE_DNSMASQ_BIN") or "/usr/sbin/dnsmasq"
+DNSMASQ_USER = "nobody"
+CAP_NET_RAW = 1 << 13
 RUNTIME_ROOT = Path(os.environ.get("NOVA_VE_RUNTIME_ROOT", "/var/lib/nova-ve"))
+# #334: root dnsmasq must not read its config — or write its lease file —
+# from a directory the service account owns (it could swap in a
+# ``dhcp-script`` or point the lease file at a root-owned target through a
+# symlink). Config, pid and leases live under /run instead: tmpfs, so the
+# helper recreates the tree on every start, and every ancestor is
+# root-owned. Not derived from RUNTIME_ROOT, and the backend cannot move it
+# through sudo (sudo resets the environment; this is root's own setting).
+# ``_check_dnsmasq_root`` refuses the tree unless every directory in it is
+# root's alone, whatever this is set to.
+DNSMASQ_ROOT = Path(os.environ.get("NOVA_VE_DNSMASQ_ROOT", "/run/nova-ve/dnsmasq"))
 IP_FORWARD_PATH = Path(os.environ.get("NOVA_VE_IP_FORWARD_PATH", "/proc/sys/net/ipv4/ip_forward"))
 IPV4_CONF_ROOT = Path(os.environ.get("NOVA_VE_IPV4_CONF_ROOT", "/proc/sys/net/ipv4/conf"))
 # Root-owned, unlike the service account's state directory.
@@ -81,11 +99,11 @@ GUARD_LOCK_PATH = Path(os.environ.get("NOVA_VE_GUARD_LOCK", "/run/nova-ve-bridge
 # Bridge: nove<lab_hash:04x>n<network_id 1-5 digits>     max 14
 # Lab bridges: nove<lab_hash:04x>n<net 1-5 digits>, plus the per-lab
 # management bridge (#287): nove<lab_hash:04x>mg
-RE_BRIDGE_NAME = re.compile(r"^nove[a-f0-9]{4}(n[0-9]{1,5}|mg)$")
+RE_BRIDGE_NAME = re.compile(r"^nove[a-f0-9]{4}(n[0-9]{1,5}|mg)\Z")
 
 # Lab network bridges only (no management bridge): the isolated-bridge DHCP
 # verbs (#325) never apply to anything else.
-RE_NETWORK_BRIDGE_NAME = re.compile(r"^nove[a-f0-9]{4}n[0-9]{1,5}$")
+RE_NETWORK_BRIDGE_NAME = re.compile(r"^nove[a-f0-9]{4}n[0-9]{1,5}\Z")
 
 # Host-owned bridges created by the provision script for Bridge-Cloud
 # networks.  Lab-side verbs MUST NOT accept these; only the dedicated
@@ -487,7 +505,7 @@ def _nsenter_cat_address(pid: int, iface: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Verb implementations (each verb = one fixed ip/nsenter invocation)
+# Verb implementations (validated arguments and fixed command forms)
 # ---------------------------------------------------------------------------
 
 
@@ -559,6 +577,68 @@ def cmd_link_netns(args: argparse.Namespace) -> int:
 def cmd_link_up(args: argparse.Namespace) -> int:
     iface = validate_iface_name(args.iface)
     return _ip("link", "set", iface, "up")
+
+
+def cmd_reconcile_taps(_args: argparse.Namespace) -> int:
+    """Apply a node's TAP changes with one helper invocation."""
+    max_bytes = 32768
+    raw = sys.stdin.buffer.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise _ValidationError("TAP batch exceeds input limit")
+    try:
+        changes = json.loads(raw)
+    except (ValueError, RecursionError) as exc:
+        raise _ValidationError("invalid TAP batch JSON") from exc
+    if not isinstance(changes, dict) or not 1 <= len(changes) <= 100:
+        raise _ValidationError("TAP batch must contain 1 to 100 interfaces")
+
+    commands: dict[str, list[list[str]]] = {}
+    for name, change in changes.items():
+        tap = validate_tap_name(name)
+        flags = {"create", "up", "detach", "host_bridge"}
+        if (
+            not isinstance(change, dict)
+            or not change
+            or change.keys() - (flags | {"master"})
+            or any(type(change[key]) is not bool for key in flags & change.keys())
+            or ("master" in change and not isinstance(change["master"], str))
+        ):
+            raise _ValidationError("invalid TAP change")
+        create = change.get("create", False)
+        up = change.get("up", False)
+        detach = change.get("detach", False)
+        master = change.get("master")
+        host_bridge = change.get("host_bridge", False)
+        if (
+            (detach and (master is not None or create or up))
+            or (host_bridge and master is None)
+            or not (create or master is not None or up or detach)
+        ):
+            raise _ValidationError("conflicting or empty TAP change")
+        operations = commands[tap] = []
+        if create:
+            operations.append([IP_BIN, "tuntap", "add", "dev", tap, "mode", "tap"])
+        if master is not None:
+            validate = validate_host_bridge_name if host_bridge else validate_bridge_name
+            operations.append([IP_BIN, "link", "set", tap, "master", validate(master)])
+        if up:
+            operations.append([IP_BIN, "link", "set", tap, "up"])
+        if detach:
+            operations.append([IP_BIN, "link", "set", tap, "nomaster"])
+
+    failures: dict[str, str] = {}
+    for tap, operations in commands.items():
+        for operation in operations:
+            try:
+                result = _run_capture(operation)
+            except OSError:
+                failures[tap] = "Could not execute the host link command."
+                break
+            if result.returncode:
+                failures[tap] = result.stderr.strip()[:512] or "Host link command failed."
+                break
+    print(json.dumps(failures))
+    return 0
 
 
 def cmd_bridge_addr_add(args: argparse.Namespace) -> int:
@@ -905,18 +985,28 @@ def cmd_bridge_guard_remove(args: argparse.Namespace) -> int:
     return _guard_locked(_guard_remove, bridge)
 
 
-def _write_private_file(path: Path, text: str) -> None:
+def _write_private_file(
+    path: Path,
+    text: str,
+    root: Path | None = None,
+    *,
+    check_dir: Callable[[Path], None] | None = None,
+) -> None:
     """Write ``path`` as root without following links the service account made.
 
     The state directory belongs to the unprivileged service account, so a
     symlink planted there must never redirect a root write. Directories are
-    created and checked one by one below ``RUNTIME_ROOT``; the file is
-    written to a fresh temporary name and renamed into place.
+    created and checked one by one below ``root``; the file is
+    written to a fresh temporary name and renamed into place. ``check_dir``
+    sees every one of those directories once it exists, for a tree whose
+    trust rules are stricter than "not a link".
     """
+    if root is None:
+        root = RUNTIME_ROOT
     # The root itself is the operator's choice and may be a link.
-    RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
-    current = RUNTIME_ROOT
-    for part in path.parent.relative_to(RUNTIME_ROOT).parts:
+    root.mkdir(parents=True, exist_ok=True)
+    current = root
+    for part in path.parent.relative_to(root).parts:
         current = current / part
         try:
             os.mkdir(current, 0o755)
@@ -924,7 +1014,9 @@ def _write_private_file(path: Path, text: str) -> None:
             pass
         if current.is_symlink() or not current.is_dir():
             raise OSError(f"refusing to write through {current}: not a plain directory")
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        if check_dir is not None:
+            check_dir(current)
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(16)}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -935,47 +1027,308 @@ def _write_private_file(path: Path, text: str) -> None:
         raise
 
 
+# Owner every directory of the dnsmasq tree must have. Root in production;
+# the tests run unprivileged and point this at their own uid, so the
+# ownership refusal is exercised without weakening the default.
+_TRUSTED_UID = 0
+
+
+def _check_trusted_dir(path: Path) -> None:
+    """Refuse ``path`` unless it is a directory that only root may change.
+
+    Only then can nobody replace what the helper writes below it. The stat
+    does not follow links: a link or a plain file where a directory belongs
+    is refused rather than used.
+    """
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise OSError(f"refusing to use {path}: {exc.strerror}") from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError(f"refusing to use {path}: not a plain directory")
+    if info.st_uid != _TRUSTED_UID:
+        raise OSError(
+            f"refusing to use {path}: owned by uid {info.st_uid}, expected {_TRUSTED_UID}"
+        )
+    if info.st_mode & 0o022:
+        raise OSError(f"refusing to use {path}: writable by group or others")
+
+
+def _ensure_dnsmasq_root() -> None:
+    """Create the tree's fixed ancestors when a reboot emptied ``/run``.
+
+    Each level is made only once the level above it passed the trust check,
+    so nothing is ever created below a planted link.
+    """
+    for candidate in (DNSMASQ_ROOT.parent, DNSMASQ_ROOT):
+        if not os.path.lexists(candidate):
+            try:
+                os.mkdir(candidate, 0o755)
+            except OSError as exc:
+                raise OSError(
+                    f"refusing to use {candidate}: cannot create it ({exc.strerror})"
+                ) from exc
+        _check_trusted_dir(candidate)
+
+
+def _check_dnsmasq_root(bridge: str | None = None) -> None:
+    """Refuse a dnsmasq tree that is not root's alone (#334).
+
+    Covers both fixed ancestors and, when it already exists, the bridge's
+    own directory. A missing directory is fine here: ``_ensure_dnsmasq_root``
+    creates and checks the ancestors before anything is written, and
+    ``_write_private_file`` checks the bridge's directory as it makes it.
+    """
+    for candidate in (DNSMASQ_ROOT.parent, DNSMASQ_ROOT):
+        if os.path.lexists(candidate):
+            _check_trusted_dir(candidate)
+    if bridge is not None and os.path.lexists(DNSMASQ_ROOT / bridge):
+        _check_trusted_dir(DNSMASQ_ROOT / bridge)
+
+
 def _dnsmasq_paths(bridge: str) -> tuple[Path, Path, Path]:
+    root = DNSMASQ_ROOT / bridge
+    return root / "dnsmasq.conf", root / "dnsmasq.pid", root / "leases"
+
+
+def _legacy_dnsmasq_paths(bridge: str) -> tuple[Path, Path, Path]:
+    """Pre-#334 locations under the service-owned data directory.
+
+    Only used to find servers started before the upgrade and to carry their
+    leases over; nothing new is written there.
+    """
     root = RUNTIME_ROOT / "nat-cloud" / bridge
     return root / "dnsmasq.conf", root / "dnsmasq.pid", root / "leases"
 
 
-def _dnsmasq_pids(bridge: str) -> list[int]:
-    """Pids of the dnsmasq processes serving ``bridge``.
+def _dnsmasq_identity_matches(entry: Path, executable: Path, allowed_uids: set[int]) -> bool:
+    """Verify the executable and kernel credentials of a discovered candidate."""
+    proc_exe = entry / "exe"
+    target = os.readlink(proc_exe)
+    installed = os.fspath(executable)
+    if target not in (installed, f"{installed} (deleted)"):
+        return False
 
-    Matched on the exact ``--conf-file`` argument rather than the pid file: a
-    lost pid file must not leave a server running, and a stale one must not
-    get another network's server killed (#320).
-    """
-    wanted = f"--conf-file={_dnsmasq_paths(bridge)[0]}".encode()
+    # A daemon can keep running a trusted executable inode after the package
+    # replaces that file. Check the kernel's target, even in that case.
+    info = proc_exe.stat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != _TRUSTED_UID
+        or not info.st_mode & 0o111
+        or info.st_mode & 0o022
+    ):
+        raise OSError("dnsmasq process executable ownership or mode could not be verified")
+
+    limit = 16 * 1024
+    with (entry / "status").open("rb") as status:
+        data = status.read(limit + 1)
+    uid_lines = [line for line in data.splitlines() if line.startswith(b"Uid:")]
+    if len(data) > limit or len(uid_lines) != 1:
+        raise OSError("dnsmasq process credentials could not be verified")
+    values = uid_lines[0][4:].split()
+    if len(values) != 4 or any(len(value) > 10 or not value.isdigit() for value in values):
+        raise OSError("dnsmasq process credentials could not be verified")
+    uids = [int(value) for value in values]
+    if any(value not in allowed_uids for value in uids):
+        return False
+    for namespace in ("user", "net", "mnt"):
+        expected_ns = (PROC_ROOT / "self" / "ns" / namespace).stat()
+        actual_ns = (entry / "ns" / namespace).stat()
+        if not os.path.samestat(expected_ns, actual_ns):
+            return False
+
+    if uids[1] != _TRUSTED_UID:
+        # The Ubuntu DHCP daemon retains NET_RAW after dropping root for
+        # address conflict checks. A matching unprivileged account alone
+        # is insufficient evidence of a configured host DHCP process.
+        caps = [line.split()[1:] for line in data.splitlines() if line.startswith(b"CapEff:")]
+        if len(caps) != 1 or len(caps[0]) != 1 or not re.fullmatch(rb"[0-9a-fA-F]{1,16}", caps[0][0]):
+            raise OSError("dnsmasq process capabilities could not be verified")
+        if not int(caps[0][0], 16) & CAP_NET_RAW:
+            raise OSError("dnsmasq process does not have its expected DHCP capability")
+    return True
+
+
+def _dnsmasq_config_arguments(bridge: str, *, include_legacy: bool = True) -> set[bytes]:
+    paths = [_dnsmasq_paths(bridge)[0]]
+    if include_legacy:
+        paths.append(_legacy_dnsmasq_paths(bridge)[0])
+    return {f"--conf-file={path}".encode() for path in paths}
+
+
+def _dnsmasq_cmdline_matches(entry: Path, wanted: set[bytes], *, verify: bool = False) -> bool:
+    limit = 16 * 1024
+    with (entry / "cmdline").open("rb") as cmdline:
+        data = cmdline.read(limit + 1)
+    argv = data.split(b"\x00")
+    if not wanted.intersection(argv[1:]):
+        return False
+    if verify and (len(data) > limit or len(argv) != 3 or not argv[0] or argv[2] or argv[1] not in wanted):
+        raise OSError("dnsmasq process has an ambiguous configuration invocation")
+    return True
+
+
+def _dnsmasq_candidates(wanted: set[bytes]) -> list[int]:
+    """Find config matches for inspection. Command arguments alone confer no authority."""
     pids: list[int] = []
     for entry in PROC_ROOT.iterdir():
-        if not entry.name.isdigit():
+        if not entry.name.isascii() or not entry.name.isdigit():
             continue
         try:
-            argv = (entry / "cmdline").read_bytes().split(b"\x00")
-        except OSError:
+            if _dnsmasq_cmdline_matches(entry, wanted):
+                pids.append(int(entry.name))
+        except (FileNotFoundError, ProcessLookupError):
             continue
-        if os.path.basename(argv[0]) == b"dnsmasq" and wanted in argv:
-            pids.append(int(entry.name))
     return sorted(pids)
 
 
-def _dnsmasq_stop_bridge(bridge: str) -> bool:
-    """Stop the bridge's dnsmasq and confirm that it is gone."""
-    for sig, attempts in ((signal.SIGTERM, 40), (signal.SIGKILL, 20)):
-        for pid in _dnsmasq_pids(bridge):
+def _dnsmasq_executable() -> Path:
+    found = shutil.which(DNSMASQ_BIN)
+    if found is None:
+        raise OSError("dnsmasq executable could not be found")
+    executable = Path(found).resolve(strict=True)
+    info = executable.stat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != _TRUSTED_UID
+        or not info.st_mode & 0o111
+        or info.st_mode & 0o022
+    ):
+        raise OSError("dnsmasq executable is not trusted")
+    return executable
+
+
+def _dnsmasq_uids() -> set[int]:
+    try:
+        daemon_uid = pwd.getpwnam(DNSMASQ_USER).pw_uid
+    except KeyError as exc:
+        raise OSError("dnsmasq runtime account is unavailable") from exc
+    if os.environ.get("SUDO_UID") == str(daemon_uid):
+        raise OSError("dnsmasq and the invoking service must use different accounts")
+    service_user = os.environ.get("NOVA_VE_SERVICE_USER") or os.environ.get("NOVA_VE_OWNER")
+    if service_user:
+        try:
+            if pwd.getpwnam(service_user).pw_uid == daemon_uid:
+                raise OSError("dnsmasq and the configured service must use different accounts")
+        except KeyError as exc:
+            raise OSError("configured Nova VE service account is unavailable") from exc
+    return {_TRUSTED_UID, daemon_uid}
+
+
+def _dnsmasq_pidfd_exited(pidfd: int) -> bool:
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN)
+    events = poller.poll(0)
+    if any(mask & (select.POLLERR | select.POLLNVAL) for _, mask in events):
+        raise OSError("dnsmasq process descriptor could not be checked")
+    return any(mask & (select.POLLIN | select.POLLHUP) for _, mask in events)
+
+
+def _require_dnsmasq_pidfds() -> None:
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        raise OSError("dnsmasq process verification requires Linux PID descriptors")
+
+
+def _pin_dnsmasq_processes(
+    candidates: list[int],
+    wanted: set[bytes],
+    executable: Path,
+    allowed_uids: set[int],
+    handles: ExitStack,
+) -> list[tuple[int, int]]:
+    _require_dnsmasq_pidfds()
+    result = []
+    for pid in candidates:
+        try:
+            pidfd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            continue
+        keep_handle = False
+        try:
+            entry = PROC_ROOT / str(pid)
             try:
-                os.kill(pid, sig)
-            except ProcessLookupError:
-                pass
-        for _attempt in range(attempts):
-            if not _dnsmasq_pids(bridge):
-                _dnsmasq_paths(bridge)[1].unlink(missing_ok=True)
-                return True
-            time.sleep(0.05)
+                keep_handle = (
+                    not _dnsmasq_pidfd_exited(pidfd)
+                    and _dnsmasq_cmdline_matches(entry, wanted)
+                    and _dnsmasq_identity_matches(entry, executable, allowed_uids)
+                    and _dnsmasq_cmdline_matches(entry, wanted, verify=True)
+                    and not _dnsmasq_pidfd_exited(pidfd)
+                )
+            except (FileNotFoundError, ProcessLookupError):
+                if not _dnsmasq_pidfd_exited(pidfd):
+                    raise
+        finally:
+            if not keep_handle:
+                os.close(pidfd)
+        if keep_handle:
+            handles.callback(os.close, pidfd)
+            result.append((pid, pidfd))
+    return result
+
+
+def _dnsmasq_stop_bridge(bridge: str) -> bool:
+    """Signal only verified processes and keep the same handles through escalation."""
+    wanted = _dnsmasq_config_arguments(bridge)
+    try:
+        candidates = _dnsmasq_candidates(wanted)
+        if not candidates:
+            return True
+        executable = _dnsmasq_executable()
+        allowed_uids = _dnsmasq_uids()
+        with ExitStack() as handles:
+            processes = _pin_dnsmasq_processes(candidates, wanted, executable, allowed_uids, handles)
+            for sig, attempts in ((signal.SIGTERM, 40), (signal.SIGKILL, 20)):
+                for pid, pidfd in processes:
+                    if _dnsmasq_pidfd_exited(pidfd):
+                        continue
+                    entry = PROC_ROOT / str(pid)
+                    try:
+                        if not (
+                            _dnsmasq_identity_matches(entry, executable, allowed_uids)
+                            and _dnsmasq_cmdline_matches(entry, wanted, verify=True)
+                        ):
+                            raise OSError("dnsmasq process identity changed before shutdown")
+                    except (FileNotFoundError, ProcessLookupError):
+                        if not _dnsmasq_pidfd_exited(pidfd):
+                            raise
+                        continue
+                    try:
+                        signal.pidfd_send_signal(pidfd, sig)
+                    except ProcessLookupError:
+                        pass
+                for _attempt in range(attempts):
+                    if all(_dnsmasq_pidfd_exited(pidfd) for _, pidfd in processes):
+                        # Do not signal a replacement that appeared after pinning.
+                        with ExitStack() as verification:
+                            remaining = _pin_dnsmasq_processes(
+                                _dnsmasq_candidates(wanted), wanted, executable, allowed_uids, verification
+                            )
+                        if not remaining:
+                            return True
+                        raise OSError("another managed dnsmasq process is still present")
+                    time.sleep(0.05)
+    except OSError as exc:
+        print(f"Could not stop dnsmasq for {bridge}: {exc}", file=sys.stderr)
+        return False
     print(f"dnsmasq for {bridge} did not stop", file=sys.stderr)
     return False
+
+
+def _remove_pidfiles(bridge: str) -> bool:
+    """Unlink both pid files once the server is gone; False when the tree is not trusted.
+
+    Stopping a server only reads ``/proc``, so a tree the helper refuses to
+    write must not keep one alive: only the unlink below it is skipped.
+    """
+    _unlink_legacy_pidfile(bridge)
+    try:
+        _check_dnsmasq_root(bridge)
+    except OSError as exc:
+        print(f"{exc}; leaving the pid file of {bridge} in place", file=sys.stderr)
+        return False
+    _dnsmasq_paths(bridge)[1].unlink(missing_ok=True)
+    return True
 
 
 def _dnsmasq_options(gateway: str, dhcp_start: str, dhcp_end: str, *, no_router: bool) -> list[str]:
@@ -1005,6 +1358,8 @@ def _write_dnsmasq_conf(
     dhcp_end: str,
     no_router: bool,
 ) -> None:
+    # The tree itself was checked before anything was stopped or read; this
+    # re-checks the bridge's directory at the moment it is made or found.
     _write_private_file(
         conf,
         "\n".join(
@@ -1013,13 +1368,131 @@ def _write_dnsmasq_conf(
                 f"interface={bridge}",
                 f"listen-address={gateway}",
                 "port=0",
+                f"user={DNSMASQ_USER}",
                 *_dnsmasq_options(gateway, dhcp_start, dhcp_end, no_router=no_router),
                 f"dhcp-leasefile={leases}",
                 f"pid-file={pidfile}",
                 "",
             ]
         ),
+        root=DNSMASQ_ROOT,
+        check_dir=_check_trusted_dir,
     )
+
+
+def _open_legacy_dir(bridge: str) -> int | None:
+    """fd for the legacy per-bridge dir, refusing every planted link.
+
+    Each component below ``RUNTIME_ROOT`` is opened relative to the previous
+    fd with ``O_NOFOLLOW``, so the service account cannot swap a component
+    for a symlink between a check and the use that follows it.
+    """
+    try:
+        fd = os.open(RUNTIME_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        for part in ("nat-cloud", bridge):
+            next_fd = os.open(
+                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd
+            )
+            os.close(fd)
+            fd = next_fd
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _unlink_legacy_pidfile(bridge: str) -> None:
+    """Remove the pre-#334 pid file without resolving planted links."""
+    fd = _open_legacy_dir(bridge)
+    if fd is None:
+        return
+    try:
+        os.unlink("dnsmasq.pid", dir_fd=fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _migrate_legacy_leases(bridge: str, leases: Path) -> None:
+    """Carry pre-#334 leases into the new root-owned location.
+
+    The legacy file lives in a service-owned directory: read it through the
+    ``O_NOFOLLOW`` dir-fd chain (never a checked-then-opened path), confirm
+    it is a regular file, and cap its size before copying the content
+    through the checked writer.
+    """
+    if leases.exists():
+        return
+    dir_fd = _open_legacy_dir(bridge)
+    if dir_fd is None:
+        return
+    try:
+        fd = os.open(
+            "leases",
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=dir_fd,
+        )
+    except OSError:
+        os.close(dir_fd)
+        return
+    os.close(dir_fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 1_048_576:
+            return
+        with os.fdopen(fd, encoding="utf-8", errors="replace") as fh:
+            fd = -1
+            text = fh.read(1_048_577)
+            if len(text) > 1_048_576:
+                return
+    except OSError:
+        return
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    # The legacy file is consumed only once a server runs on this copy, which
+    # may be a later attempt: the note says which starts still owe that.
+    _write_private_file(_legacy_lease_note(bridge), "", root=DNSMASQ_ROOT, check_dir=_check_trusted_dir)
+    _write_private_file(leases, text, root=DNSMASQ_ROOT, check_dir=_check_trusted_dir)
+    try:
+        os.chmod(leases, 0o644)
+    except OSError:
+        pass
+
+
+def _legacy_lease_note(bridge: str) -> Path:
+    """Marks leases that were copied from the legacy file, which is still to be consumed."""
+    return DNSMASQ_ROOT / bridge / "leases.imported"
+
+
+def _finish_legacy_leases(bridge: str) -> None:
+    """Consume the legacy lease file now that a server runs on its copy.
+
+    /run is tmpfs, so a legacy file that stayed would be imported again on
+    every boot. Only a running server makes the move final: a start that
+    failed must leave the file, because the copy may be gone with the next
+    boot. Only a file the helper copied is ever consumed, so one it refused
+    (too large, or not a regular file) is left as it is.
+    """
+    note = _legacy_lease_note(bridge)
+    if not os.path.lexists(note):
+        return
+    dir_fd = _open_legacy_dir(bridge)
+    if dir_fd is None:
+        return
+    try:
+        os.rename("leases", "leases.pre-334", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass  # consumed already
+    except OSError:
+        return  # left for the next start
+    finally:
+        os.close(dir_fd)
+    note.unlink(missing_ok=True)
 
 
 def cmd_dnsmasq_start(args: argparse.Namespace) -> int:
@@ -1037,29 +1510,63 @@ def cmd_dnsmasq_start(args: argparse.Namespace) -> int:
     ):
         raise _ValidationError("server inside dhcp range")
 
+    # #334: fail closed on a tree that is not root's alone, before anything
+    # below it is read, written, unlinked or any server is stopped.
+    try:
+        _ensure_dnsmasq_root()
+        _check_dnsmasq_root(bridge)
+        _require_dnsmasq_pidfds()
+        executable = _dnsmasq_executable()
+        allowed_uids = _dnsmasq_uids()
+    except OSError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
     if not _dnsmasq_stop_bridge(bridge):
         return 1
+    _remove_pidfiles(bridge)
     conf, pidfile, leases = _dnsmasq_paths(bridge)
     try:
+        _migrate_legacy_leases(bridge, leases)
         _write_dnsmasq_conf(conf, pidfile, leases, bridge, gateway, dhcp_start, dhcp_end, no_router)
     except OSError as exc:
         print(f"failed to write {conf}: {exc}", file=sys.stderr)
         return 1
-    rc = _run([DNSMASQ_BIN, f"--conf-file={conf}"])
+    rc = _run([str(executable), f"--conf-file={conf}"])
     if rc != 0:
         return rc
     # dnsmasq daemonises after binding; confirm the daemon stayed up.
-    pids = _dnsmasq_pids(bridge)
-    if not pids:
-        print(f"dnsmasq for {bridge} exited right after starting", file=sys.stderr)
+    wanted = _dnsmasq_config_arguments(bridge, include_legacy=False)
+    try:
+        with ExitStack() as handles:
+            processes = _pin_dnsmasq_processes(
+                _dnsmasq_candidates(wanted), wanted, executable, allowed_uids, handles
+            )
+            if not processes:
+                raise OSError("daemon exited right after starting or could not be verified")
+            if len(processes) != 1:
+                raise OSError("expected one verified daemon after startup")
+    except OSError as exc:
+        print(f"Could not verify dnsmasq for {bridge}: {exc}", file=sys.stderr)
         return 1
-    print(pids[0])
+    _finish_legacy_leases(bridge)
+    print(processes[0][0])
     return 0
 
 
 def cmd_dnsmasq_stop(args: argparse.Namespace) -> int:
     bridge = validate_bridge_name(args.bridge)
-    return 0 if _dnsmasq_stop_bridge(bridge) else 1
+    if not _dnsmasq_stop_bridge(bridge):
+        return 1
+    # The server is gone either way; a tree the helper refuses still needs
+    # an operator, so the verb must not look like a clean stop.
+    return 0 if _remove_pidfiles(bridge) else 1
+
+
+def cmd_dnsmasq_layout_version(args: argparse.Namespace) -> int:
+    """Report the protected DHCP layout without touching host state."""
+    print("root-owned-dnsmasq-v1")
+    return 0
 
 
 def cmd_link_set_name_in_netns(args: argparse.Namespace) -> int:
@@ -1148,6 +1655,9 @@ def cmd_console_proxy_start(args: argparse.Namespace) -> int:
         target_pid = authorize_pid(args.pid)
     listen_port = _validate_port(args.listen_port, label="listen_port")
     target_port = _validate_port(args.target_port, label="target_port")
+    log_id = getattr(args, "log_id", None)
+    if log_id is not None and re.fullmatch(r"[0-9a-f]{32}", log_id) is None:
+        raise _ValidationError("invalid console proxy log identifier")
     if listen_port < 1024:
         raise _ValidationError(
             "listen_port must be a non-privileged port (>=1024)"
@@ -1172,22 +1682,16 @@ def cmd_console_proxy_start(args: argparse.Namespace) -> int:
             second = os.fork()
             if second == 0:
                 # Grandchild: replace with the proxy.
-                os.close(pipe_w)
                 devnull = os.open(os.devnull, os.O_RDWR)
                 os.dup2(devnull, 0)
                 os.dup2(devnull, 1)
                 os.dup2(devnull, 2)
                 if devnull > 2:
                     os.close(devnull)
-                os.execv(
-                    CONSOLE_PROXY_BIN,
-                    [
-                        CONSOLE_PROXY_BIN,
-                        str(target_pid),
-                        str(listen_port),
-                        str(target_port),
-                    ],
-                )
+                argv = [CONSOLE_PROXY_BIN, str(target_pid), str(listen_port), str(target_port)]
+                if log_id is not None:
+                    argv.append(log_id)
+                os.execv(CONSOLE_PROXY_BIN, argv)
             else:
                 os.write(pipe_w, f"{second}\n".encode("ascii"))
                 os._exit(0)
@@ -1197,15 +1701,16 @@ def cmd_console_proxy_start(args: argparse.Namespace) -> int:
             except OSError:
                 pass
             os._exit(1)
-    # Parent: read the grandchild PID, reap the first child, then return.
+    # Both children close the non-inheritable pipe on exit or successful exec.
+    # Read through EOF so an exec error also reaches the caller.
     os.close(pipe_w)
     with os.fdopen(pipe_r, "r") as r:
-        line = r.readline().strip()
+        lines = r.read().splitlines()
     os.waitpid(pid, 0)
-    if line.startswith("err:") or not line.isdigit():
-        print(f"console proxy spawn failed: {line}", file=sys.stderr)
+    if len(lines) != 1 or not lines[0].isdigit():
+        print(f"console proxy spawn failed: {' '.join(lines)}", file=sys.stderr)
         return 1
-    print(line)
+    print(lines[0])
     return 0
 
 
@@ -1300,6 +1805,7 @@ VERB_TABLE: Mapping[str, Callable[[argparse.Namespace], int]] = {
     "link-set-nomaster": cmd_link_set_nomaster,
     "link-netns": cmd_link_netns,
     "link-up": cmd_link_up,
+    "reconcile-taps": cmd_reconcile_taps,
     "bridge-addr-add": cmd_bridge_addr_add,
     "bridge-addr-del": cmd_bridge_addr_del,
     "bridge-guard-apply": cmd_bridge_guard_apply,
@@ -1312,6 +1818,7 @@ VERB_TABLE: Mapping[str, Callable[[argparse.Namespace], int]] = {
     "forward-remove": cmd_forward_remove,
     "dnsmasq-start": cmd_dnsmasq_start,
     "dnsmasq-stop": cmd_dnsmasq_stop,
+    "dnsmasq-layout-version": cmd_dnsmasq_layout_version,
     "link-set-name-in-netns": cmd_link_set_name_in_netns,
     "addr-add-in-netns": cmd_addr_add_in_netns,
     "addr-up-in-netns": cmd_addr_up_in_netns,
@@ -1327,8 +1834,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nova-ve-net.py",
         description=(
-            "Privileged network helper for nova-ve.  Each verb is a "
-            "fixed ip/nsenter invocation with regex-validated arguments."
+            "Privileged network helper for nova-ve. Commands are "
+            "allowlisted and arguments are validated before execution."
         ),
     )
     sub = parser.add_subparsers(dest="verb", required=True, metavar="VERB")
@@ -1375,6 +1882,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("link-up", help="ip link set <iface> up")
     p.add_argument("iface")
+
+    sub.add_parser("reconcile-taps", help="Apply a bounded set of TAP changes from JSON on stdin")
 
     p = sub.add_parser("bridge-addr-add", help="ip addr replace <cidr> dev <bridge>")
     p.add_argument("bridge")
@@ -1431,6 +1940,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("dnsmasq-stop", help="stop per-bridge dnsmasq DHCP/DNS")
     p.add_argument("bridge")
 
+    sub.add_parser("dnsmasq-layout-version", help="report the protected DHCP layout version")
+
     p = sub.add_parser(
         "link-set-name-in-netns",
         help="nsenter -t <pid> -n ip link set <oldname> name <newname>",
@@ -1477,6 +1988,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("pid")
     p.add_argument("listen_port")
     p.add_argument("target_port")
+    p.add_argument("--log-id")
 
     p = sub.add_parser(
         "console-proxy-stop",
@@ -1495,6 +2007,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # #334: what the helper creates must not depend on who invoked it. A
+    # tight umask would lock the backend out of the dnsmasq leases it only
+    # reads; a loose one would open the dnsmasq tree to everyone.
+    os.umask(0o022)
     parser = build_parser()
     # argparse exits 2 on parse failure (unknown verb, missing args); we
     # let that propagate.  We use exit code 3 only if an unknown verb

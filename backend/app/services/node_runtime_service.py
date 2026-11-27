@@ -35,15 +35,26 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Coroutine, Iterator, Optional
 
 import psutil
 
+from app.services.lab_paths import (
+    find_runtime_lab_path,
+    iter_lab_json_files,
+    lab_identity,
+    publish_runtime_event,
+    read_canonical_lab,
+    runtime_lab_paths,
+)
 from app.config import get_settings
 from app.services import host_net, qemu_versions, runtime_pids
+from app.services.runtime_mutex import RuntimeMutexContention, runtime_mutex
 from app.services.shared_network_service import bridge_identity
 
 
@@ -52,6 +63,9 @@ _DOCKER_RESTART_POLICIES = {"no", "on-failure", "unless-stopped", "always"}
 # US-287: truthy spellings accepted for the docker node ``mgmt_access``
 # extras flag (opt-in per-lab management attachment, ``mgmt0``).
 _MGMT_ACCESS_TRUTHY = {"1", "true", "yes", "on"}
+# ``mgmt0`` host octets handed to nodes start at 2 (``.1`` is the gateway).
+_MGMT_FIRST_OCTET = 2
+_MGMT_OCTET_COUNT = 250
 _HEARTBEAT_INTERVAL_S: float = 5.0
 _TRANSITION_SUPPRESS_S: float = 30.0
 
@@ -125,6 +139,21 @@ def _extra_bool(extras: dict[str, Any], key: str, default: bool = False) -> bool
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _mgmt_access_enabled(node: dict[str, Any]) -> bool:
+    """Whether a docker node opted into the per-lab ``mgmt0`` attachment (#287)."""
+    extras = _node_extras(node)
+    return _extra_str(extras, "mgmt_access").strip().lower() in _MGMT_ACCESS_TRUTHY
+
+
+def _mgmt_host_octet(node_id: int) -> int:
+    """A node's preferred ``mgmt0`` host octet: its number, folded into the range.
+
+    The bridge gateway keeps ``.1``, and ``.0`` and ``.255`` are the network
+    and broadcast addresses, so 250 octets are left.
+    """
+    return _MGMT_FIRST_OCTET + (max(int(node_id), 1) - 1) % _MGMT_OCTET_COUNT
 
 
 _PLATFORM_DESKTOP_IMAGES = {
@@ -323,8 +352,12 @@ def _default_docker_inspect(docker_binary: str, docker_host: str, container_name
 
 class NodeRuntimeService:
     _registry: dict[str, dict[str, Any]] = {}
+    _observed_inactive: set[str] = set()
+    _reserved_console_ports: set[int] = set()
+    _console_port_scope = threading.local()
     _loaded = False
     _lock = threading.Lock()
+    _runtime_loop: asyncio.AbstractEventLoop | None = None
     # Maps (lab_id, node_id) -> monotonic timestamp of last deliberate start/stop.
     # Heartbeat skips reconciliation for entries younger than _TRANSITION_SUPPRESS_S.
     _transition_timestamps: dict[tuple[str, int], float] = {}
@@ -334,7 +367,6 @@ class NodeRuntimeService:
     # it.  lab_topology snapshots include the current value so the frontend can
     # reject events from older generations (gen <= topology_generation is stale).
     _discovery_generation: dict[str, int] = {}
-
     def __init__(self) -> None:
         self.settings = get_settings()
         self.runtime_dir = self.settings.TMP_DIR / "node-runtime"
@@ -353,6 +385,7 @@ class NodeRuntimeService:
     def reset_registry(cls) -> None:
         with cls._lock:
             cls._registry.clear()
+            cls._observed_inactive.clear()
             cls._loaded = False
         cls._transition_timestamps.clear()
         cls._discovery_generation.clear()
@@ -380,11 +413,42 @@ class NodeRuntimeService:
             return False
         return (time.monotonic() - ts) < _TRANSITION_SUPPRESS_S
 
+    @staticmethod
+    @contextmanager
+    def _node_lifecycle_lock(lab_id: str, node_id: int):
+        try:
+            with runtime_mutex.acquire_node_sync(lab_id, node_id, timeout=0):
+                yield
+        except RuntimeMutexContention as exc:
+            raise NodeRuntimeError("A node operation is in progress. Retry the request.") from exc
+
     def start_node(self, lab_data: dict[str, Any], node_id: int) -> dict[str, Any]:
         lab_id = self._lab_id(lab_data)
+        with self._node_lifecycle_lock(lab_id, node_id), self._reserve_console_ports():
+            return self._start_node(lab_data, lab_id, node_id)
+
+    @contextmanager
+    def _reserve_console_ports(self):
+        """Keep first-free choices reserved until this synchronous launch exits."""
+        if getattr(self._console_port_scope, "ports", None) is not None:
+            yield
+            return
+        ports: set[int] = set()
+        self._console_port_scope.ports = ports
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._reserved_console_ports.difference_update(ports)
+            del self._console_port_scope.ports
+
+    def _start_node(self, lab_data: dict[str, Any], lab_id: str, node_id: int) -> dict[str, Any]:
         node = self._node_data(lab_data, node_id)
         key = self._key(lab_id, node_id)
-        runtime = self._runtime_record(lab_id, node_id)
+        saved = self._runtime_record(lab_id, node_id, include_stopped=True, require_valid=True)
+        if saved and saved.get("lab_cleanup_pending"):
+            raise NodeRuntimeError("Retry the pending lab deletion before starting this node.")
+        runtime = self._runtime_record(lab_id, node_id, require_valid=True)
         if not runtime and node.get("type") == "docker":
             runtime = self._reconcile_docker_node_runtime(lab_data, node)
         if runtime:
@@ -403,7 +467,18 @@ class NodeRuntimeService:
         if node.get("type") == "qemu":
             runtime = self._start_qemu_node(lab_data, node)
         elif node.get("type") == "docker":
-            runtime = self._start_docker_node(lab_data, node)
+            if _mgmt_access_enabled(node):
+                from app.services.lab_lock import lab_lock, LabLockTimeout
+
+                lock_name = "mgmt-" + hashlib.sha256(lab_id.encode()).hexdigest()
+                try:
+                    with lab_lock(lock_name, self.runtime_dir, timeout_s=60, namespace=False):
+                        self._check_mgmt_address_available(lab_id, node_id)
+                        runtime = self._start_docker_node(lab_data, node)
+                except LabLockTimeout as exc:
+                    raise NodeRuntimeError("Timed out waiting for management address allocation") from exc
+            else:
+                runtime = self._start_docker_node(lab_data, node)
         elif node.get("type") in ("iol", "iou"):
             runtime = self._start_iol_node(lab_data, node)
         elif node.get("type") == "dynamips":
@@ -414,6 +489,7 @@ class NodeRuntimeService:
         self._record_transition(lab_id, node_id)
         with self._lock:
             self._registry[key] = runtime
+            self._observed_inactive.discard(key)
         self._persist_runtime(runtime)
 
         # Cadence: schedule live-MAC reads at t=1s/3s/8s after start. No steady-state poll.
@@ -430,22 +506,33 @@ class NodeRuntimeService:
         node_id: int,
         interfaces: list[dict[str, Any]],
     ) -> None:
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-
         async def _run_cadence() -> None:
             for delay in (1.0, 3.0, 8.0):
                 await asyncio.sleep(delay)
+                path = await find_runtime_lab_path(self.settings.LABS_DIR, lab_id)
+                if path is None:
+                    continue
                 for index, iface in enumerate(interfaces):
                     if not isinstance(iface, dict):
                         continue
                     interface_index = int(iface.get("index", index))
-                    result = self.read_live_mac(lab_id, node_id, interface_index, lab_data=lab_data)
-                    await self._publish_live_mac(lab_id, node_id, interface_index, result)
+                    result = await asyncio.to_thread(
+                        self.read_live_mac, lab_id, node_id, interface_index, lab_data=lab_data
+                    )
+                    await self._publish_live_mac(lab_id, node_id, interface_index, result, path=path)
 
-        loop.create_task(_run_cadence())
+        self._schedule_runtime_task(_run_cadence)
+
+    @classmethod
+    def _schedule_runtime_task(cls, make_task: Callable[[], Coroutine[Any, Any, None]]) -> None:
+        loop = cls._runtime_loop
+        if loop is None or not loop.is_running():
+            return
+        try:
+            loop.call_soon_threadsafe(lambda: loop.create_task(make_task()))
+        except RuntimeError:
+            # The backend loop shut down before the callback could be queued.
+            return
 
     async def _publish_live_mac(
         self,
@@ -453,6 +540,8 @@ class NodeRuntimeService:
         node_id: int,
         interface_index: int,
         result: dict[str, Any],
+        *,
+        path: str | None = None,
     ) -> None:
         try:
             from app.services.ws_hub import ws_hub  # local import to avoid cycles
@@ -467,7 +556,10 @@ class NodeRuntimeService:
             "reason": result.get("reason"),
         }
         try:
-            await ws_hub.publish(lab_id, "interface_live_mac", payload, rev=str(lab_id))
+            await publish_runtime_event(
+                ws_hub, self.settings.LABS_DIR, lab_id, "interface_live_mac", payload,
+                path=path, rev=lab_id,
+            )
         except Exception:
             return
 
@@ -746,39 +838,83 @@ class NodeRuntimeService:
                 return iface
         return None
 
-    def stop_node(self, lab_data: dict[str, Any], node_id: int) -> None:
+    def lab_runtime_node_ids(self, lab_id: str) -> set[int]:
+        """Include saved and in-memory nodes that no longer appear in the topology."""
+        with self._lock:
+            node_ids = {row["node_id"] for row in self._registry.values() if row.get("lab_id") == lab_id}
+        prefix = f"{lab_id}-"
+        for record in self.runtime_dir.glob("*.json"):
+            if record.stem.startswith(prefix):
+                suffix = record.stem[len(prefix):]
+                if suffix.isascii() and suffix.isdecimal():
+                    node_ids.add(int(suffix))
+        for record in (self.settings.TMP_DIR / lab_id).glob("*/dynamips.json"):
+            name = record.parent.name
+            if name.isascii() and name.isdecimal():
+                node_ids.add(int(name))
+        return node_ids
+
+    def stop_node(self, lab_data: dict[str, Any], node_id: int, *, confirm_stopped: bool = False) -> None:
         lab_id = self._lab_id(lab_data)
-        runtime = self._runtime_record(lab_id, node_id)
+        with self._node_lifecycle_lock(lab_id, node_id):
+            self._stop_node(lab_data, lab_id, node_id, confirm_stopped=confirm_stopped)
+
+    def _stop_node(
+        self, lab_data: dict[str, Any], lab_id: str, node_id: int, *, confirm_stopped: bool,
+    ) -> None:
+        runtime = self._runtime_record(lab_id, node_id, include_stopped=True, require_valid=True)
+        if runtime and not confirm_stopped:
+            if runtime.get("lab_cleanup_pending"):
+                raise NodeRuntimeError("Retry the pending lab deletion to finish node cleanup.")
+            runtime = self._runtime_record(lab_id, node_id, require_valid=True)
         if not runtime:
+            if confirm_stopped:
+                if (self._work_dir(lab_id, node_id) / "dynamips.json").exists():
+                    raise NodeRuntimeError("The Dynamips node has no verified runtime record. Resolve its hypervisor state before retrying.")
+                if str(node_id) not in (lab_data.get("nodes") or {}):
+                    return
+            node = self._node_data(lab_data, node_id)
+            if node.get("type") == "docker":
+                if confirm_stopped:
+                    if not host_net.sandbox_mode():
+                        docker = self._resolve_binary("docker")
+                        if not docker or not self._docker_container_absent(docker, self._container_name(lab_id, node_id)):
+                            raise NodeRuntimeError("A Docker node could not be verified without its runtime record.")
+                    return
+                state = self.docker_network_state(lab_id, node_id)
+                if state and state["network_mode"] != "none":
+                    raise NodeRuntimeError(self.legacy_docker_message(node, state))
             return
 
+        if confirm_stopped and not runtime.get("lab_cleanup_pending"):
+            runtime = {**runtime, "lab_cleanup_pending": True}
+            with self._lock:
+                self._persist_runtime(runtime)
+                self._registry[self._key(lab_id, node_id)] = runtime
         self._record_transition(lab_id, node_id)
         kind = runtime.get("kind")
+        stop_options = {"confirm_stopped": True} if confirm_stopped else {}
         if kind == "qemu":
-            # Issue #175 (C1): hold node mutex so stop + delete cannot
-            # interleave a concurrent reconcile/attach/start persist write.
-            from app.services.runtime_mutex import runtime_mutex
-
-            with runtime_mutex.acquire_node_sync(lab_id, node_id):
-                self._stop_qemu_runtime(runtime)
-                self._delete_runtime(lab_id, node_id)
-            return
-        if kind == "docker":
-            self._stop_docker_runtime(runtime)
+            self._stop_qemu_runtime(runtime, **stop_options)
+        elif kind == "docker":
+            self._stop_docker_runtime(runtime, **stop_options)
         elif kind == "iol":
-            self._stop_iol_runtime(runtime)
+            self._stop_iol_runtime(runtime, **stop_options)
         elif kind == "dynamips":
-            self._stop_dynamips_runtime(runtime)
+            self._stop_dynamips_runtime(runtime, **stop_options)
+        elif confirm_stopped:
+            raise NodeRuntimeError("The node runtime cannot be identified for cleanup.")
 
         self._delete_runtime(lab_id, node_id)
 
     def wipe_node(self, lab_data: dict[str, Any], node_id: int) -> None:
         lab_id = self._lab_id(lab_data)
-        self.stop_node(lab_data, node_id)
+        with self._node_lifecycle_lock(lab_id, node_id):
+            self.stop_node(lab_data, node_id)
 
-        work_dir = self._work_dir(lab_id, node_id)
-        if work_dir.exists():
-            shutil.rmtree(work_dir)
+            work_dir = self._work_dir(lab_id, node_id)
+            if work_dir.exists():
+                shutil.rmtree(work_dir)
 
     def enrich_nodes(self, lab_data: dict[str, Any]) -> dict[str, Any]:
         lab_id = self._lab_id(lab_data)
@@ -805,13 +941,37 @@ class NodeRuntimeService:
     def runtime_counts(self) -> dict[str, int]:
         counts = {"qemu": 0, "docker": 0, "iol": 0, "dynamips": 0, "vpcs": 0}
         for runtime in list(self._registry.values()):
-            live_runtime = self._runtime_record(runtime["lab_id"], runtime["node_id"])
+            lab_id, node_id = runtime["lab_id"], runtime["node_id"]
+            try:
+                live_runtime = self._runtime_record(lab_id, node_id)
+            except (TypeError, ValueError, OverflowError):
+                _logger.warning(
+                    "Ignoring invalid liveness data in runtime file %r", self._state_path(lab_id, node_id).name
+                )
+                continue
             if not live_runtime:
                 continue
             kind = live_runtime.get("kind")
             if kind in counts:
                 counts[kind] += 1
         return counts
+
+    def running_nodes_by_lab(self) -> dict[str, int]:
+        """Running node count per lab id; only labs with something running.
+
+        Use heartbeat observations and lifecycle updates without probing
+        individual nodes on every lab listing (#365).
+        """
+        with self._lock:
+            records = [
+                record for key, record in self._registry.items()
+                if key not in self._observed_inactive and not record.get("lab_cleanup_pending")
+            ]
+        running: dict[str, int] = {}
+        for record in records:
+            lab_id = record["lab_id"]
+            running[lab_id] = running.get(lab_id, 0) + 1
+        return running
 
     def is_node_running(self, lab_id: str, node_id: int) -> bool:
         """Registry-authoritative liveness check (#262).
@@ -850,6 +1010,12 @@ class NodeRuntimeService:
         runtime = self._runtime_record(lab_id, node_id)
         if not runtime:
             raise NodeRuntimeError(f"Node is not running: {node_id}")
+        if runtime.get("kind") == "docker":
+            with self._node_lifecycle_lock(lab_id, node_id):
+                runtime = self._runtime_record(lab_id, node_id)
+                if not runtime or runtime.get("kind") != "docker":
+                    raise NodeRuntimeError(f"Node is not running: {node_id}")
+                runtime = self._ensure_console_proxy(lab_id, node_id, runtime, mode=mode, node_extras=_node_extras(node))
 
         node_name = node.get("name", f"node-{node_id}")
 
@@ -865,9 +1031,6 @@ class NodeRuntimeService:
             console_mode = str(runtime.get("console", node.get("console", "telnet")))
             console_port = int(runtime.get("console_port", 0))
             connection_name = node_name
-
-        if runtime.get("kind") == "docker":
-            runtime = self._ensure_console_proxy(lab_id, node_id, runtime, mode=mode)
 
         return {
             "lab_id": lab_id,
@@ -912,6 +1075,8 @@ class NodeRuntimeService:
         node_id: int,
         runtime: dict[str, Any],
         mode: str = "primary",
+        *,
+        node_extras: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Re-spawn a dead console proxy for a running Docker node.
 
@@ -963,7 +1128,8 @@ class NodeRuntimeService:
             new_pid = host_net.console_proxy_start(
                 node_pid=int(container_pid),
                 listen_port=listen_port,
-                target_port=self._container_console_port(console_mode),
+                target_port=self._docker_container_console_port(console_mode, node_extras or {}),
+                log_id=host_net.console_proxy_log_id(lab_id, node_id, mode),
             )
         except Exception as exc:
             _logger.warning(
@@ -1028,6 +1194,7 @@ class NodeRuntimeService:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        cls._runtime_loop = loop
         loop.create_task(cls._heartbeat_loop())
 
     @classmethod
@@ -1057,20 +1224,7 @@ class NodeRuntimeService:
             return
 
         # Build lab_id -> relative filename map by scanning LABS_DIR once per cycle.
-        lab_id_to_filename: dict[str, str] = {}
-        if labs_dir.exists():
-            for lab_file in labs_dir.rglob("*.json"):
-                try:
-                    raw = json.loads(lab_file.read_text())
-                except (OSError, json.JSONDecodeError):
-                    continue
-                file_lab_id = str(raw.get("id", "")).strip()
-                if file_lab_id and file_lab_id not in lab_id_to_filename:
-                    try:
-                        relative = lab_file.relative_to(labs_dir).as_posix()
-                    except ValueError:
-                        continue
-                    lab_id_to_filename[file_lab_id] = relative
+        lab_id_to_filename = await runtime_lab_paths(labs_dir)
 
         for _key, runtime in registry_snapshot:
             lab_id = str(runtime.get("lab_id", "")).strip()
@@ -1082,7 +1236,7 @@ class NodeRuntimeService:
             except (TypeError, ValueError):
                 continue
 
-            if cls._is_suppressed(lab_id, node_id):
+            if runtime.get("lab_cleanup_pending") or cls._is_suppressed(lab_id, node_id):
                 continue
 
             filename = lab_id_to_filename.get(lab_id)
@@ -1090,53 +1244,81 @@ class NodeRuntimeService:
                 continue
 
             kind = runtime.get("kind", "")
-            is_alive = await asyncio.get_running_loop().run_in_executor(
-                None, cls._check_alive_sync, runtime, kind, settings
-            )
+            try:
+                is_alive = await asyncio.get_running_loop().run_in_executor(
+                    None, cls._check_alive_sync, runtime, kind, settings
+                )
+            except (TypeError, ValueError, OverflowError):
+                _logger.warning(
+                    "Ignoring invalid liveness data in runtime file %r", f"{lab_id}-{node_id}.json"
+                )
+                continue
 
             # status: 2 = running, 0 = stopped
             expected_status = 2 if is_alive else 0
+            reconciled = False
 
             try:
                 # Waits for the lock without blocking the event loop.
                 async with locked_lab_async(filename) as lab:
+                    if lab_identity(lab.data) != lab_id:
+                        continue
+                    with cls._lock:
+                        if cls._registry.get(_key) is not runtime:
+                            continue
+                        if is_alive:
+                            cls._observed_inactive.discard(_key)
+                        else:
+                            cls._observed_inactive.add(_key)
                     nodes: dict = lab.data.get("nodes") or {}
                     node = nodes.get(str(node_id))
                     if not isinstance(node, dict):
-                        continue
-                    current_status = int(node.get("status", -1))
-                    if current_status == expected_status:
-                        continue
-                    node["status"] = expected_status
-                    # #248: status reconcile is bookkeeping, not an edit —
-                    # don't invalidate editors' If-Match tokens.
-                    lab.save(bump_revision=False)
+                        # A node the lab no longer defines has no status to reconcile.
+                        current_status = expected_status
+                    else:
+                        current_status = int(node.get("status", -1))
+                        if current_status != expected_status:
+                            node["status"] = expected_status
+                            # #248: status reconcile is bookkeeping, not an edit —
+                            # don't invalidate editors' If-Match tokens.
+                            lab.save(bump_revision=False)
+                            reconciled = True
             except Exception:
                 _logger.exception(
                     "heartbeat: failed to reconcile lab=%s node=%s", lab_id, node_id
                 )
                 continue
 
-            _logger.info(
-                "heartbeat reconciled: lab=%s node=%s status %d -> %d",
-                lab_id, node_id, current_status, expected_status,
-            )
-
-            # If the process is dead according to reality, clean up the registry entry.
-            if not is_alive:
-                cls._delete_runtime_class(lab_id, node_id, settings)
-
-            try:
-                await ws_hub.publish(
-                    lab_id,
-                    "node_status_reconciled",
-                    {"node_id": node_id, "status": expected_status},
-                    rev=str(lab_id),
+            if reconciled:
+                _logger.info(
+                    "heartbeat reconciled: lab=%s node=%s status %d -> %d",
+                    lab_id, node_id, current_status, expected_status,
                 )
-            except Exception:
-                _logger.exception(
-                    "heartbeat: ws publish failed for lab=%s node=%s", lab_id, node_id
-                )
+
+            # If the process is dead according to reality, clean up the registry
+            # entry — whether or not there was a status to flip (#373). The
+            # backend's own start path never writes status=2 to lab.json, so a
+            # node started through the API alone gets here with the stored
+            # status already 0; skipping the cleanup on that path left a dead
+            # record in the registry until something happened to probe that node.
+            if is_alive is False:
+                cls._discard_inactive_runtime(runtime, settings)
+
+            if reconciled:
+                try:
+                    await publish_runtime_event(
+                        ws_hub,
+                        labs_dir,
+                        lab_id,
+                        "node_status_reconciled",
+                        {"node_id": node_id, "status": expected_status},
+                        path=filename,
+                        rev=lab_id,
+                    )
+                except Exception:
+                    _logger.exception(
+                        "heartbeat: ws publish failed for lab=%s node=%s", lab_id, node_id
+                    )
 
     # ------------------------------------------------------------------
     # Issue #225 — orphan-process reconciliation
@@ -1169,7 +1351,7 @@ class NodeRuntimeService:
             return stats
 
         known: dict[str, dict[int, dict]] = {}
-        for lab_file in labs_dir.rglob("*.json"):
+        for lab_file in iter_lab_json_files(labs_dir):
             try:
                 raw = json.loads(lab_file.read_text())
             except (OSError, json.JSONDecodeError):
@@ -1258,6 +1440,7 @@ class NodeRuntimeService:
 
                 with cls._lock:
                     cls._registry[key] = runtime
+                    cls._observed_inactive.discard(key)
                 registered.add(key)
 
                 try:
@@ -1467,24 +1650,16 @@ class NodeRuntimeService:
         compare against ``links[]``, and publish ``discovered_link`` events
         for kernel-side members with no declared link.
         """
-        from app.services.lab_service import LabService  # avoid cycles
         from app.services.ws_hub import ws_hub
 
         settings = get_settings()
-        labs_dir = settings.LABS_DIR
-        if not labs_dir.exists():
-            return
-
-        for lab_file in labs_dir.rglob("*.json"):
-            try:
-                data = json.loads(lab_file.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            lab_id = str(data.get("id", "")).strip()
-            if not lab_id:
+        labs_dir = settings.LABS_DIR.resolve()
+        for lab_id, lab_path in (await runtime_lab_paths(labs_dir)).items():
+            data = await asyncio.to_thread(read_canonical_lab, labs_dir, labs_dir / lab_path)
+            if data is None or lab_identity(data) != lab_id:
                 continue
             try:
-                await cls._discover_lab(lab_id, data, ws_hub)
+                await cls._discover_lab(lab_id, data, ws_hub, lab_path)
             except Exception:
                 _discovery_logger.exception(
                     "discovery: failed lab=%s", lab_id
@@ -1492,7 +1667,7 @@ class NodeRuntimeService:
 
     @classmethod
     async def _discover_lab(
-        cls, lab_id: str, lab_data: dict[str, Any], ws_hub: Any
+        cls, lab_id: str, lab_data: dict[str, Any], ws_hub: Any, lab_path: str
     ) -> None:
         """Scan bridges for one lab and publish ``discovered_link`` /
         ``link_divergent`` WS events.
@@ -1598,7 +1773,9 @@ class NodeRuntimeService:
                     "generation": gen,
                 }
                 try:
-                    await ws_hub.publish(lab_id, "discovered_link", payload)
+                    await publish_runtime_event(
+                        ws_hub, get_settings().LABS_DIR, lab_id, "discovered_link", payload, path=lab_path,
+                    )
                 except Exception:
                     _discovery_logger.exception(
                         "discovery: ws publish failed lab=%s iface=%s",
@@ -1610,6 +1787,7 @@ class NodeRuntimeService:
         # ------------------------------------------------------------------
         await cls._publish_divergent_links(
             lab_id=lab_id,
+            lab_path=lab_path,
             lab_data=lab_data,
             kernel_members=kernel_members,
             is_leased=is_leased,
@@ -1622,6 +1800,7 @@ class NodeRuntimeService:
         cls,
         *,
         lab_id: str,
+        lab_path: str,
         lab_data: dict[str, Any],
         kernel_members: set[str],
         is_leased: Callable[..., bool] | None,
@@ -1698,7 +1877,9 @@ class NodeRuntimeService:
                 "generation": generation,
             }
             try:
-                await ws_hub.publish(lab_id, "link_divergent", payload)
+                await publish_runtime_event(
+                    ws_hub, get_settings().LABS_DIR, lab_id, "link_divergent", payload, path=lab_path,
+                )
             except Exception:
                 _discovery_logger.exception(
                     "discovery: ws publish failed lab=%s link_id=%s",
@@ -1799,67 +1980,116 @@ class NodeRuntimeService:
             return None
 
     @staticmethod
-    def _check_alive_sync(runtime: dict[str, Any], kind: str, settings: Any) -> bool:
-        """Synchronous liveness check suitable for run_in_executor."""
+    def _check_alive_sync(runtime: dict[str, Any], kind: str, settings: Any) -> bool | None:
+        """Return False only when the workload is absent, None when cleanup remains possible."""
         if kind == "docker":
             import subprocess as _sp
             import shutil as _sh
             docker_binary = _sh.which("docker")
             if not docker_binary:
                 docker_binary = "docker"
-            container_name = runtime.get("container_name")
-            if not container_name:
-                return False
-            result = _sp.run(
-                [
-                    docker_binary,
-                    "--host",
-                    settings.DOCKER_HOST,
-                    "inspect",
-                    "-f",
-                    "{{.State.Running}}",
-                    container_name,
-                ],
-                capture_output=True,
-                text=True,
-            )
-            return result.returncode == 0 and result.stdout.strip() == "true"
+            container_id = NodeRuntimeService._saved_docker_id(runtime)
+            target = container_id or runtime.get("container_name")
+            if not target:
+                return None
+            try:
+                result = _sp.run(
+                    [
+                        docker_binary,
+                        "--host",
+                        settings.DOCKER_HOST,
+                        "container",
+                        "inspect",
+                        "-f",
+                        "{{.State.Running}}",
+                        "--",
+                        target,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            if result.returncode:
+                reason = result.stderr.lower()
+                if container_id and ("no such container" in reason or "no such object" in reason):
+                    return False
+                return None
+            return True if result.stdout.strip() == "true" else None
+
+        if kind == "dynamips":
+            from app.services.runtime.dynamips import DynamipsLauncher
+
+            return DynamipsLauncher.instance().is_alive(runtime)
 
         # QEMU / other — use psutil
         pid = runtime.get("pid")
         if not pid:
-            return False
+            return None
         try:
-            process = psutil.Process(int(pid))
-        except psutil.Error:
-            return False
-        expected_create_time = runtime.get("pid_create_time")
-        if expected_create_time and abs(process.create_time() - expected_create_time) > 1:
-            return False
-        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+            return NodeRuntimeService._cleanup_process(pid, runtime.get("pid_create_time")) is not None
+        except NodeRuntimeError:
+            return None
 
     @classmethod
-    def _delete_runtime_class(cls, lab_id: str, node_id: int, settings: Any) -> None:
-        """Remove registry entry and state file (class-level, no instance needed)."""
-        key = f"{lab_id}:{node_id}"
+    def _discard_inactive_runtime(cls, runtime: dict[str, Any], settings: Any) -> None:
+        """Discard a liveness snapshot only if it still describes the current runtime."""
+        lab_id, node_id = runtime["lab_id"], runtime["node_id"]
+        key = cls._key(lab_id, node_id)
+        state_path = settings.TMP_DIR / "node-runtime" / f"{lab_id}-{node_id}.json"
         with cls._lock:
+            if (
+                cls._registry.get(key) is not runtime
+                or runtime.get("lab_cleanup_pending")
+                or runtime.get("kind") in {"dynamips", "iol"}
+            ):
+                return
+            try:
+                state_path.unlink(missing_ok=True)
+            except OSError:
+                return
             cls._registry.pop(key, None)
-        runtime_dir = settings.TMP_DIR / "node-runtime"
-        state_path = runtime_dir / f"{lab_id}-{node_id}.json"
+            cls._observed_inactive.discard(key)
+
+    def _read_runtime_record(self, state_path: Path, *, require_valid: bool = False) -> dict[str, Any] | None:
         try:
-            if state_path.exists():
-                state_path.unlink()
-        except OSError:
-            pass
+            runtime = json.loads(state_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, RecursionError):
+            runtime = None
+
+        if (
+            isinstance(runtime, dict)
+            and isinstance(runtime.get("lab_id"), str)
+            and runtime["lab_id"].strip()
+            and type(runtime.get("node_id")) is int
+            and state_path == self._state_path(runtime["lab_id"], runtime["node_id"])
+            and type(runtime.get("kind")) in (str, type(None))
+            and (runtime.get("pid") is None or type(runtime["pid"]) is int and runtime["pid"] >= 0)
+            and (
+                runtime.get("pid_create_time") is None
+                or type(runtime["pid_create_time"]) in (int, float)
+                and -sys.float_info.max <= runtime["pid_create_time"] <= sys.float_info.max
+            )
+            and type(runtime.get("container_name")) in (str, type(None))
+            and "\0" not in (runtime.get("container_name") or "")
+        ):
+            return runtime
+
+        _logger.warning("Ignoring malformed runtime state file %r", state_path.name)
+        if require_valid:
+            raise NodeRuntimeError("Repair the malformed runtime state before changing this node.")
+        return None
 
     def _load_registry(self) -> None:
         with self._lock:
             if self._loaded:
                 return
             for state_file in self.runtime_dir.glob("*.json"):
-                try:
-                    runtime = json.loads(state_file.read_text())
-                except (json.JSONDecodeError, OSError):
+                runtime = self._read_runtime_record(state_file)
+                if runtime is None:
                     continue
                 key = self._key(runtime["lab_id"], runtime["node_id"])
                 self._registry[key] = runtime
@@ -1877,24 +2107,26 @@ class NodeRuntimeService:
     def _delete_runtime(self, lab_id: str, node_id: int) -> None:
         key = self._key(lab_id, node_id)
         with self._lock:
+            self._state_path(lab_id, node_id).unlink(missing_ok=True)
             self._registry.pop(key, None)
-        state_path = self._state_path(lab_id, node_id)
-        if state_path.exists():
-            state_path.unlink()
+            self._observed_inactive.discard(key)
 
     def _runtime_record(
         self,
         lab_id: str,
         node_id: int,
         include_stopped: bool = False,
+        *,
+        require_valid: bool = False,
     ) -> dict[str, Any] | None:
         key = self._key(lab_id, node_id)
-        runtime = self._registry.get(key)
-        if not runtime:
-            state_path = self._state_path(lab_id, node_id)
-            if state_path.exists():
-                runtime = json.loads(state_path.read_text())
-                with self._lock:
+        with self._lock:
+            runtime = self._registry.get(key)
+            if not runtime:
+                runtime = self._read_runtime_record(
+                    self._state_path(lab_id, node_id), require_valid=require_valid
+                )
+                if runtime is not None:
                     self._registry[key] = runtime
 
         if not runtime:
@@ -1903,8 +2135,10 @@ class NodeRuntimeService:
         if include_stopped:
             return runtime
 
+        if runtime.get("lab_cleanup_pending"):
+            return None
+
         if not self._is_runtime_alive(runtime):
-            self._delete_runtime(lab_id, node_id)
             return None
         return runtime
 
@@ -2657,9 +2891,7 @@ class NodeRuntimeService:
         container_name = self._container_name(lab_id, node["id"])
         network_specs = self._docker_network_specs(lab_data, node)
         extras = _node_extras(node)
-        mgmt_enabled = (
-            _extra_str(extras, "mgmt_access").strip().lower() in _MGMT_ACCESS_TRUTHY
-        )
+        mgmt_enabled = _mgmt_access_enabled(node)
         container_console_port = self._docker_container_console_port(console_mode, extras)
         # Optional second console (#268): publish and proxy a second host port
         # into the container's secondary console service, mirroring the
@@ -2696,7 +2928,7 @@ class NodeRuntimeService:
         # roll back.  Yields the node's static mgmt0 address.
         mgmt_runtime: dict[str, Any] | None = None
         if mgmt_enabled:
-            mgmt_runtime = self._ensure_docker_mgmt_bridge(lab_id, node_id)
+            mgmt_runtime = self._ensure_docker_mgmt_bridge(lab_id, node_id, lab_data)
 
         # ----- Build the docker run command (no networking flags) ----------
         # No ``--rm``: it conflicts with ``--restart`` (docker rejects with
@@ -2856,6 +3088,7 @@ class NodeRuntimeService:
                 node_pid=pid,
                 listen_port=int(console_port),
                 target_port=int(container_console_port),
+                log_id=host_net.console_proxy_log_id(lab_id, node_id),
             )
         except Exception as exc:
             _logger.warning(
@@ -2872,6 +3105,7 @@ class NodeRuntimeService:
                     node_pid=pid,
                     listen_port=int(second_console_port),
                     target_port=int(second_container_console_port),
+                    log_id=host_net.console_proxy_log_id(lab_id, node_id, "second"),
                 )
             except Exception as exc:
                 _logger.warning(
@@ -2970,7 +3204,7 @@ class NodeRuntimeService:
     # ------------------------------------------------------------------
 
     def _ensure_docker_mgmt_bridge(
-        self, lab_id: str, node_id: int
+        self, lab_id: str, node_id: int, lab_data: dict[str, Any]
     ) -> dict[str, Any]:
         """Ensure the per-lab ``mgmt`` bridge exists and pick the node's address.
 
@@ -2984,10 +3218,11 @@ class NodeRuntimeService:
 
         Returns ``{bridge_name, gateway_cidr, container_ip_cidr}`` where
         ``container_ip_cidr`` is the static address handed to the node's
-        ``mgmt0`` (``172.16.X.{2 + (node_id - 1) % 250}/24`` — the bridge
-        gateway ``.1`` is never handed to a node).
+        ``mgmt0``: ``172.16.X.<host octet>/24``, the node's deterministic octet. The bridge
+        gateway ``.1`` is never handed to a node.
 
-        Raises ``NodeRuntimeError`` when no candidate subnet is free.
+        Raises ``NodeRuntimeError`` when no candidate subnet is free, or when
+        another running container may hold the node's address.
         """
         bridge = host_net.mgmt_bridge_name(lab_id)
         owned: dict[str, str] = {}
@@ -3006,13 +3241,33 @@ class NodeRuntimeService:
             host_net.bridge_addr_add(bridge, gateway_cidr)
 
         subnet = ipaddress.ip_network(gateway_cidr, strict=False)
-        host_octet = 2 + (max(int(node_id), 1) - 1) % 250
+        host_octet = _mgmt_host_octet(node_id)
         container_ip = f"{subnet.network_address + host_octet}/24"
         return {
             "bridge_name": bridge,
             "gateway_cidr": str(gateway_cidr),
             "container_ip_cidr": container_ip,
         }
+
+    def _check_mgmt_address_available(self, lab_id: str, node_id: int) -> None:
+        """Fail closed if a running lab container could use the same address."""
+        binary = self._resolve_binary("docker")
+        if not binary:
+            raise NodeRuntimeError("Docker binary not found")
+        try:
+            result = subprocess.run(
+                [binary, "--host", self.settings.DOCKER_HOST, "ps", "--format", "{{.Names}}"],
+                capture_output=True, text=True,
+            )
+        except OSError as exc:
+            raise NodeRuntimeError("Could not inspect running containers") from exc
+        if result.returncode != 0 or not isinstance(result.stdout, str):
+            raise NodeRuntimeError("Could not inspect running containers")
+        names = set(result.stdout.splitlines())
+        for other_id in range(1, host_net.MAX_NODE_ID + 1):
+            if other_id != node_id and _mgmt_host_octet(other_id) == _mgmt_host_octet(node_id):
+                if self._container_name(lab_id, other_id) in names:
+                    raise NodeRuntimeError("A running node may already use this management address")
 
     def _pick_mgmt_gateway_cidr(
         self,
@@ -3163,6 +3418,15 @@ class NodeRuntimeService:
             f"runtime_mutex.acquire(...) yourself."
         )
 
+        with runtime_mutex.acquire_node_sync(lab_id, node_id, timeout=0):
+            return self._attach_docker_interface_inner(
+                lab_id, node_id, network_id, interface_index, bridge_name=bridge_name,
+            )
+
+    def _attach_docker_interface_inner(
+        self, lab_id: str, node_id: int, network_id: int, interface_index: int,
+        *, bridge_name: str | None,
+    ) -> dict[str, Any]:
         runtime = self._runtime_record(lab_id, node_id)
         if runtime is None:
             raise NodeRuntimeError(
@@ -3311,9 +3575,20 @@ class NodeRuntimeService:
             f"({lab_id!r}, {node_id}, {interface_index})."
         )
 
+        with runtime_mutex.acquire_node_sync(lab_id, node_id, timeout=0):
+            return self._detach_docker_interface_inner(
+                lab_id, node_id, interface_index, expected_generation=expected_generation,
+            )
+
+    def _detach_docker_interface_inner(
+        self, lab_id: str, node_id: int, interface_index: int,
+        *, expected_generation: int | None,
+    ) -> dict[str, Any]:
         runtime = self._runtime_record(lab_id, node_id, include_stopped=True)
         if runtime is None:
             return {"state": "absent", "reason": "no runtime record"}
+        if runtime.get("lab_cleanup_pending"):
+            raise NodeRuntimeError("Retry the pending lab deletion to finish node cleanup.")
 
         # Locate the matching attachment record. Missing means the iface is
         # already detached — idempotent no-op.
@@ -3470,9 +3745,13 @@ class NodeRuntimeService:
         bridge_name: str | None = None,
         nic_model: str | None = None,
         planned_mac: str | None = None,
+        _lab_lock_held: bool = False,
     ) -> dict[str, Any]:
         """US-303 PRIVATE hot-add NIC. Mutex MUST be held.
 
+        ``_lab_lock_held`` (#331): set when the caller holds the lab's file
+        lock. The planned MAC is then not written to lab.json here, because
+        the lock is not reentrant and waiting for it would stall the caller.
         Sequence (rollback per the plan §US-303):
 
           1. Acquire lock — done by caller; assert mutex is held here.
@@ -3539,6 +3818,7 @@ class NodeRuntimeService:
                 bridge_name=bridge_name,
                 nic_model=nic_model,
                 planned_mac=planned_mac,
+                _lab_lock_held=_lab_lock_held,
             )
 
     def _attach_qemu_interface_inner(
@@ -3551,6 +3831,7 @@ class NodeRuntimeService:
         bridge_name: str | None = None,
         nic_model: str | None = None,
         planned_mac: str | None = None,
+        _lab_lock_held: bool = False,
     ) -> dict[str, Any]:
         """Body of :meth:`_attach_qemu_interface_locked`. Caller holds
         BOTH the per-iface mutex (from the outer public entrypoint) and
@@ -3906,7 +4187,10 @@ class NodeRuntimeService:
         # ``firstmac`` default case would leave ``interface.planned_mac``
         # empty and the mismatch detector would have nothing to compare
         # against.
-        if planned_mac:
+        # The caller that holds the lab lock records the MAC in its own copy
+        # of the lab: taking the same, non-reentrant lock here would wait out
+        # the whole timeout on the event loop (#331).
+        if planned_mac and not _lab_lock_held:
             try:
                 self._persist_planned_mac_to_lab_json(
                     lab_id, int(node_id), int(interface_index), planned_mac
@@ -4439,15 +4723,7 @@ class NodeRuntimeService:
         interface_index: int,
         message: str,
     ) -> None:
-        """US-304 forced-fallback: publish a ``node_warning`` WS event so
-        the UI can surface the "guest did not eject" condition.
-
-        Goes through :class:`app.services.ws_hub.ws_hub` (the existing
-        per-lab event hub) — there is no separate ``ws_manager`` service.
-        Fire-and-forget: we schedule the coroutine on the running event
-        loop if one is available, otherwise we fall back to
-        ``asyncio.run`` so sync callers still get the broadcast.
-        """
+        """Send a forced-detach warning on the backend's WebSocket loop."""
         from app.services.ws_hub import ws_hub  # local import — cycle-free
 
         payload = {
@@ -4455,16 +4731,15 @@ class NodeRuntimeService:
             "interface_index": int(interface_index),
             "message": message,
         }
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is not None and loop.is_running():
-            loop.create_task(ws_hub.publish(lab_id, "node_warning", payload))
-            return
-        # No running loop — synchronous caller. Run the publish in a
-        # short-lived loop so the event still goes out.
-        asyncio.run(ws_hub.publish(lab_id, "node_warning", payload))
+        async def publish() -> None:
+            try:
+                await publish_runtime_event(
+                    ws_hub, self.settings.LABS_DIR, lab_id, "node_warning", payload,
+                )
+            except Exception:
+                _logger.exception("Could not publish the node runtime warning")
+
+        self._schedule_runtime_task(publish)
 
     def _qmp_command(
         self, socket_path: str, command: str, arguments: dict[str, Any] | None = None
@@ -4544,7 +4819,7 @@ class NodeRuntimeService:
         return True, None
 
     def reconcile_qemu_node_links(
-        self, lab_id: str, lab_data: dict, node: dict
+        self, lab_id: str, lab_data: dict, node: dict, *, batch_host: bool = False,
     ) -> dict:
         """Issue #174: converge runtime + kernel state for a running QEMU
         node to match ``lab_data["links"]`` for every BOOT-time interface
@@ -4583,8 +4858,64 @@ class NodeRuntimeService:
 
         with runtime_mutex.acquire_node_sync(lab_id, node_id):
             return self._reconcile_qemu_node_links_locked(
-                lab_id, lab_data, node, node_id
+                lab_id, lab_data, node, node_id, batch_host=batch_host,
             )
+
+    @staticmethod
+    def _reconcile_boot_taps(
+        lab_id: str,
+        node_id: int,
+        boot_ethernet: int,
+        expected: dict[int, dict],
+        attachments: list[dict],
+    ) -> dict[int, str]:
+        """Apply planned host changes before setting a node's guest carrier."""
+        changes: dict[str, host_net.TapChange] = {}
+        indices: dict[str, list[int]] = {}
+        failures: dict[int, str] = {}
+        connected_taps = {want["tap_name"] for want in expected.values()}
+        recorded_taps = {}
+        for entry in attachments:
+            try:
+                index = int(entry.get("interface_index", -1))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < boot_ethernet and index not in expected and entry.get("boot_nic"):
+                tap = entry.get("tap_name") or host_net.tap_name(lab_id, node_id, index)
+                if recorded_taps.setdefault(index, tap) != tap:
+                    failures[index] = "Conflicting stale TAP records for this interface."
+
+        for index in range(boot_ethernet):
+            if index in failures:
+                continue
+            want = expected.get(index)
+            tap = (
+                want["tap_name"] if want else
+                recorded_taps.get(index) or host_net.tap_name(lab_id, node_id, index)
+            )
+            try:
+                if want:
+                    change = host_net.tap_attachment_change(tap, want["bridge_name"], want.get("driver"))
+                else:
+                    if tap in connected_taps:
+                        failures[index] = "Stale TAP record conflicts with a connected interface."
+                        continue
+                    exists, master, _up = host_net.link_state(tap)
+                    change = {"detach": True} if exists and master is not None else {}
+            except host_net.HostNetError as exc:
+                failures[index] = str(exc)
+                continue
+            if change:
+                changes[tap] = change
+                indices.setdefault(tap, []).append(index)
+
+        try:
+            errors = host_net.reconcile_taps(changes)
+        except host_net.HostNetError as exc:
+            errors = dict.fromkeys(changes, str(exc))
+        for tap, error in errors.items():
+            failures.update(dict.fromkeys(indices[tap], error))
+        return failures
 
     def _reconcile_qemu_node_links_locked(
         self,
@@ -4592,6 +4923,8 @@ class NodeRuntimeService:
         lab_data: dict,
         node: dict,
         node_id: int,
+        *,
+        batch_host: bool = False,
     ) -> dict:
         """Body of :meth:`reconcile_qemu_node_links`. Caller holds the
         per-(lab, node) node-scoped mutex (issue #175 C1).
@@ -4669,7 +5002,17 @@ class NodeRuntimeService:
         with self._lock:
             attachments = list(runtime.get("interface_attachments") or [])
 
+        host_failures = (
+            self._reconcile_boot_taps(lab_id, node_id, boot_ethernet, expected, attachments)
+            if batch_host else {}
+        )
+        warnings.extend(
+            {"interface_index": idx, "reason": reason} for idx, reason in host_failures.items()
+        )
+
         for idx, want in expected.items():
+            if idx in host_failures:
+                continue
             tap = want["tap_name"]
             bridge = want["bridge_name"]
             try:
@@ -4677,16 +5020,15 @@ class NodeRuntimeService:
                 # privileged helper spawns the kernel state doesn't already
                 # satisfy — unconditional re-application cost ~150ms per op
                 # (200+ spawns, ~30s frozen event loop on node-dense labs).
-                exists, master, admin_up = host_net.link_state(tap)
-                if not exists:
-                    # Defensive: a pre-#174 process or a race left no TAP.
-                    # Recreate so the e1000 backend has something to talk to.
-                    host_net.tap_add(tap)
-                    master, admin_up = None, False
-                if master != bridge:
-                    host_net.link_master_any(tap, bridge, driver=want.get("driver"))
-                if not admin_up:
-                    host_net.link_up(tap)
+                if not batch_host:
+                    exists, master, admin_up = host_net.link_state(tap)
+                    if not exists:
+                        host_net.tap_add(tap)
+                        master, admin_up = None, False
+                    if master != bridge:
+                        host_net.link_master_any(tap, bridge, driver=want.get("driver"))
+                    if not admin_up:
+                        host_net.link_up(tap)
                 if socket_path:
                     try:
                         self._qmp_command(
@@ -4764,7 +5106,7 @@ class NodeRuntimeService:
                     recorded_boot_indices.add(idx)
 
         for idx in range(boot_ethernet):
-            if idx in expected or idx in recorded_boot_indices:
+            if idx in expected or idx in recorded_boot_indices or idx in host_failures:
                 continue
 
             tap = host_net.tap_name(lab_id, node_id, idx)
@@ -4782,9 +5124,10 @@ class NodeRuntimeService:
                 # #277: nomaster only when a master is actually set — a
                 # never-created or already-detached TAP needs no
                 # privileged spawn.
-                _exists, _master, _up = host_net.link_state(tap)
-                if _exists and _master is not None:
-                    host_net.link_set_nomaster(tap)
+                if not batch_host:
+                    exists, master, _up = host_net.link_state(tap)
+                    if exists and master is not None:
+                        host_net.link_set_nomaster(tap)
             except host_net.HostNetError as exc:
                 warnings.append({"interface_index": idx, "reason": f"nomaster: {exc}"})
 
@@ -4799,7 +5142,7 @@ class NodeRuntimeService:
                 idx = int(entry.get("interface_index", -1))
             except (TypeError, ValueError):
                 continue
-            if idx in expected:
+            if idx in expected or idx in host_failures:
                 continue
             if not bool(entry.get("boot_nic", False)) or idx >= boot_ethernet:
                 # Hot-add ifaces have their own US-304 path. We don't drive
@@ -4820,9 +5163,10 @@ class NodeRuntimeService:
             try:
                 # #277: same state guard as Phase 2 — skip the privileged
                 # spawn when the TAP is absent or already detached.
-                _exists, _master, _up = host_net.link_state(tap)
-                if _exists and _master is not None:
-                    host_net.link_set_nomaster(tap)
+                if not batch_host:
+                    exists, master, _up = host_net.link_state(tap)
+                    if exists and master is not None:
+                        host_net.link_set_nomaster(tap)
             except host_net.HostNetError as exc:
                 warnings.append({"interface_index": idx, "reason": f"nomaster: {exc}"})
 
@@ -4844,6 +5188,7 @@ class NodeRuntimeService:
             "removed": removed,
             "warnings": warnings,
             "skipped_hotplug": skipped_hotplug,
+            "host_failures": host_failures,
         }
 
     def _find_free_pcie_slot(
@@ -4947,7 +5292,7 @@ class NodeRuntimeService:
         # ``rglob`` (not ``glob``) so nested lab folders are discoverable —
         # consistent with the discovery scan at
         # :meth:`NodeRuntimeService.reconcile_qemu_node_links`.
-        for path in labs_dir.rglob("*.json"):
+        for path in iter_lab_json_files(labs_dir):
             try:
                 rel = path.relative_to(labs_dir).as_posix()
                 data = LabService.read_lab_json_static(rel)
@@ -5075,47 +5420,44 @@ class NodeRuntimeService:
         Idempotent: a non-empty existing value is left untouched (the
         operator may have set an explicit MAC; we never overwrite it).
         """
-        from app.services.lab_lock import lab_lock  # local import: cycle-free
-        from app.services.lab_service import LabService  # noqa: WPS433
+        from app.services.lab_service import LabService, _lab_file_path, locked_lab
 
         try:
             settings = get_settings()
         except Exception:  # noqa: BLE001
             return
-        labs_dir = Path(settings.LABS_DIR)
+        labs_dir = Path(settings.LABS_DIR).resolve()
         if not labs_dir.exists():
             return
 
-        # Find the lab.json file whose ``id`` matches lab_id.
-        target: Optional[Path] = None
-        for path in labs_dir.glob("*.json"):
+        for path in iter_lab_json_files(labs_dir):
+            relative = path.relative_to(labs_dir).as_posix()
             try:
-                data = LabService.read_lab_json_static(path.name)
+                if _lab_file_path(relative) != path:
+                    continue
+                data = LabService.read_lab_json_static(relative)
             except Exception:  # noqa: BLE001
                 continue
-            if str(data.get("id") or "") == lab_id:
-                target = path
-                break
-        if target is None:
-            return
+            if str(data.get("id") or "") != lab_id:
+                continue
 
-        with lab_lock(target.name, labs_dir):
-            data = LabService.read_lab_json_static(target.name)
-            node = data.get("nodes", {}).get(str(int(node_id)))
-            if not isinstance(node, dict):
-                return
-            iface = self._lookup_interface(node, int(interface_index))
-            if not isinstance(iface, dict):
-                return
-            existing = iface.get("planned_mac")
-            if existing:  # non-empty: respect operator-supplied MAC.
-                return
-            iface["planned_mac"] = str(planned_mac)
-            # Strip the read-time topology shim so the writer does not
-            # regenerate links[] from a stale snapshot.
-            data.pop("topology", None)
-            # #248: MAC assignment on start is runtime bookkeeping, not an edit.
-            LabService.write_lab_json_static(target.name, data, bump_revision=False)
+            try:
+                with locked_lab(relative) as lab:
+                    if _lab_file_path(relative) != path or str(lab.data.get("id") or "") != lab_id:
+                        continue
+                    node = lab.data.get("nodes", {}).get(str(int(node_id)))
+                    if not isinstance(node, dict):
+                        return
+                    iface = self._lookup_interface(node, int(interface_index))
+                    if not isinstance(iface, dict) or iface.get("planned_mac"):
+                        return
+                    iface["planned_mac"] = str(planned_mac)
+                    lab.data.pop("topology", None)
+                    # #248: save runtime bookkeeping without an editor revision.
+                    lab.save(bump_revision=False)
+                    return
+            except FileNotFoundError:
+                continue
 
     def _docker_force_remove(self, docker_binary: str, container_name: str) -> None:
         """Force-remove a container, swallowing any error (best-effort cleanup)."""
@@ -5159,9 +5501,18 @@ class NodeRuntimeService:
             host_net.sweep_node_host_ifaces(lab_id, node_id)
             return None
 
-        pid = self._docker_container_pid(docker_binary, container_name)
-        if not pid:
-            return None
+        state = self.docker_network_state(lab_id, node_id)
+        if state is None:
+            raise NodeRuntimeError("Could not verify Docker networking; retry before starting this node.")
+        if state["network_mode"] != "none":
+            raise NodeRuntimeError(self.legacy_docker_message(node, state))
+
+        console_mode = node.get("console", "rdp")
+        console_port = self._allocate_console_port(console_mode)
+        second_console_mode = node.get("second_console") or None
+        second_console_port = self._allocate_console_port(second_console_mode) if second_console_mode else None
+
+        pid = state["pid"]
 
         try:
             runtime_pids.register(pid, "docker", lab_id, node_id)
@@ -5176,14 +5527,13 @@ class NodeRuntimeService:
         except psutil.Error:
             pid_create_time = None
 
-        console_mode = node.get("console", "rdp")
-        console_port = self._allocate_console_port(console_mode)
         console_proxy_pid: int | None = None
         try:
             console_proxy_pid = host_net.console_proxy_start(
                 node_pid=pid,
                 listen_port=int(console_port),
-                target_port=int(self._container_console_port(console_mode)),
+                target_port=self._docker_container_console_port(console_mode, _node_extras(node)),
+                log_id=host_net.console_proxy_log_id(lab_id, node_id),
             )
         except Exception as exc:
             _logger.warning(
@@ -5196,11 +5546,8 @@ class NodeRuntimeService:
         # Secondary console proxy (#268): re-spawned on adoption since the
         # netns-spliced forwarder from the original start is gone after a
         # backend restart.
-        second_console_mode = node.get("second_console") or None
-        second_console_port: int | None = None
         second_console_proxy_pid: int | None = None
-        if second_console_mode:
-            second_console_port = self._allocate_console_port(second_console_mode)
+        if second_console_port is not None:
             try:
                 second_console_proxy_pid = host_net.console_proxy_start(
                     node_pid=pid,
@@ -5210,6 +5557,7 @@ class NodeRuntimeService:
                             second_console_mode, _node_extras(node)
                         )
                     ),
+                    log_id=host_net.console_proxy_log_id(lab_id, node_id, "second"),
                 )
             except Exception as exc:
                 _logger.warning(
@@ -5264,7 +5612,9 @@ class NodeRuntimeService:
             "started_at": time.time(),
         }
         with self._lock:
-            self._registry[self._key(lab_id, node_id)] = runtime
+            key = self._key(lab_id, node_id)
+            self._registry[key] = runtime
+            self._observed_inactive.discard(key)
         self._persist_runtime(runtime)
         return runtime
 
@@ -5310,6 +5660,71 @@ class NodeRuntimeService:
                 or remove.stdout.strip()
                 or f"Failed to remove stale Docker container {container_name}"
             )
+
+    def docker_network_state(
+        self, lab_id: str, node_id: int, container_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Inspect a running same-name candidate without adopting or changing it.
+
+        The historical naming scheme truncates lab IDs and carries no ownership
+        label, so a name match alone does not establish ownership.
+        """
+        name = container_name or self._container_name(lab_id, node_id)
+        docker = self._resolve_binary("docker")
+        if not docker:
+            raise NodeRuntimeError("Could not inspect Docker networking; Docker is unavailable.")
+        try:
+            result = subprocess.run(
+                [docker, "--host", self.settings.DOCKER_HOST, "inspect", "-f", "{{json .}}", name],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise NodeRuntimeError("Could not inspect Docker networking; retry before linking.") from exc
+        if result.returncode != 0:
+            if "no such object" in result.stderr.lower() or "no such container" in result.stderr.lower():
+                return None
+            raise NodeRuntimeError("Could not inspect Docker networking; retry before linking.")
+        try:
+            info = json.loads(result.stdout)
+            if not info["State"]["Running"]:
+                return None
+            mode = info["HostConfig"]["NetworkMode"]
+            pid = info["State"]["Pid"]
+            if not isinstance(mode, str) or not mode or not isinstance(pid, int) or pid <= 0:
+                raise ValueError("missing network mode or container PID")
+            return {"container_name": name, "network_mode": mode, "pid": pid}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise NodeRuntimeError("Could not inspect Docker networking; retry before linking.") from exc
+
+    @staticmethod
+    def legacy_docker_message(node: dict[str, Any], state: dict[str, str]) -> str:
+        return (
+            f"A running Docker container named {state['container_name']} matches node "
+            f"{node.get('name') or node.get('id')} and uses legacy networking. "
+            "Verify its ownership, stop and remove it in Docker, then start the node again."
+        )
+
+    def legacy_docker_nodes(self, lab_data: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+        """Report same-name legacy candidates, including inspection failures."""
+        lab_id = self._lab_id(lab_data)
+        found: list[dict[str, Any]] = []
+        unavailable: list[dict[str, Any]] = []
+        for key, node in (lab_data.get("nodes") or {}).items():
+            if not isinstance(node, dict) or node.get("type") != "docker":
+                continue
+            try:
+                node_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            item = {"node_id": node_id, "name": str(node.get("name") or node_id)}
+            try:
+                state = self.docker_network_state(lab_id, node_id)
+            except NodeRuntimeError:
+                unavailable.append(item)
+                continue
+            if state and state["network_mode"] != "none":
+                found.append({**item, "container_name": state["container_name"], "network_mode": state["network_mode"], "ownership": "unverified"})
+        return {"legacy_nodes": found, "legacy_inspection_unavailable": unavailable}
 
     def _docker_container_running_by_name(
         self,
@@ -5412,15 +5827,57 @@ class NodeRuntimeService:
         attachments.sort(key=lambda item: item["interface_index"])
         return attachments
 
-    def _stop_qemu_runtime(self, runtime: dict[str, Any]) -> None:
+    @staticmethod
+    def _cleanup_process(pid: int, expected_create_time: float | None = None) -> psutil.Process | None:
+        if type(pid) is not int or pid <= 0:
+            raise NodeRuntimeError("Invalid node process identity during cleanup.")
+        if expected_create_time is not None and (
+            type(expected_create_time) not in (int, float) or not 0 < expected_create_time <= sys.float_info.max
+        ):
+            raise NodeRuntimeError("Invalid node process start time during cleanup.")
+        try:
+            process = psutil.Process(pid)
+            if expected_create_time is not None and process.create_time() != expected_create_time:
+                return None
+            if process.status() == psutil.STATUS_ZOMBIE:
+                return None
+            return process
+        except psutil.NoSuchProcess:
+            return None
+        except psutil.Error as exc:
+            raise NodeRuntimeError("Could not verify the node process during cleanup.") from exc
+
+    def _confirm_process_exit(self, pid: int, expected_create_time: float | None = None) -> None:
+        process = self._cleanup_process(pid, expected_create_time)
+        if process is None:
+            return
+        try:
+            process.wait(timeout=5)
+        except psutil.NoSuchProcess:
+            return
+        except psutil.Error as exc:
+            raise NodeRuntimeError("Could not confirm that the node process stopped.") from exc
+
+    def _stop_qemu_runtime(self, runtime: dict[str, Any], *, confirm_stopped: bool = False) -> None:
         pid = runtime.get("pid")
         if not pid:
+            if confirm_stopped:
+                raise NodeRuntimeError("QEMU runtime has no process identity to verify.")
             self._sweep_qemu_taps(runtime)
             return
+        if confirm_stopped:
+            expected = runtime.get("pid_create_time")
+            if self._cleanup_process(pid, expected) is None:
+                self._sweep_qemu_taps(runtime)
+                return
+            if expected is None:
+                raise NodeRuntimeError("QEMU runtime has no recorded process start time.")
 
         try:
             os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError:
+            if confirm_stopped:
+                self._confirm_process_exit(pid, expected)
             self._sweep_qemu_taps(runtime)
             self._unregister_pid(pid)
             return
@@ -5429,13 +5886,19 @@ class NodeRuntimeService:
 
         try:
             psutil.Process(pid).wait(timeout=5)
+        except psutil.NoSuchProcess:
+            pass
         except (psutil.Error, psutil.TimeoutExpired):
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                host_net.qemu_process_signal(pid, "kill")
+            if not confirm_stopped or self._cleanup_process(pid, expected) is not None:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    host_net.qemu_process_signal(pid, "kill")
+
+        if confirm_stopped:
+            self._confirm_process_exit(int(pid), runtime.get("pid_create_time"))
 
         # US-302: sweep the per-NIC TAPs owned by this VM. Best-effort
         # via ``try_link_del`` so already-removed TAPs (cleanup sweeper
@@ -5467,14 +5930,49 @@ class NodeRuntimeService:
         except Exception:  # noqa: BLE001 — best-effort cleanup
             pass
 
-    def _stop_docker_runtime(self, runtime: dict[str, Any]) -> None:
+    def _docker_container_absent(self, docker: str, name: str) -> bool:
+        try:
+            result = subprocess.run(
+                [docker, "--host", self.settings.DOCKER_HOST, "container", "inspect", "--", name],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise NodeRuntimeError("Could not verify Docker container absence.") from exc
+        if not result.returncode:
+            return False
+        reason = result.stderr.lower()
+        if "no such container" in reason or "no such object" in reason:
+            return True
+        raise NodeRuntimeError("Could not verify Docker container absence.")
+
+    @staticmethod
+    def _saved_docker_id(runtime: dict[str, Any]) -> str | None:
+        container_id = runtime.get("container_id")
+        if isinstance(container_id, str) and re.fullmatch("[0-9a-f]{64}", container_id):
+            return container_id
+        return None
+
+    def _stop_docker_runtime(self, runtime: dict[str, Any], *, confirm_stopped: bool = False) -> None:
         docker_binary = self._resolve_binary("docker")
         if not docker_binary:
+            if confirm_stopped:
+                raise NodeRuntimeError("Docker is unavailable for lab cleanup.")
             return
 
         container_name = runtime.get("container_name")
         if not container_name:
+            if confirm_stopped:
+                raise NodeRuntimeError("Docker runtime has no container identity to verify.")
             return
+        command_options = {"timeout": 15} if confirm_stopped else {}
+        target = container_name
+        if confirm_stopped:
+            container_id = self._saved_docker_id(runtime)
+            if container_id is None:
+                if self._docker_container_absent(docker_binary, container_name):
+                    return
+                raise NodeRuntimeError("Docker runtime has no verified container ID for cleanup.")
+            target = container_id
 
         # Stop the console TCP forwarder before tearing down the container so
         # in-flight client connections see a clean refused-after-stop instead
@@ -5494,16 +5992,27 @@ class NodeRuntimeService:
             except Exception:
                 pass
 
-        subprocess.run(
-            [docker_binary, "--host", self.settings.DOCKER_HOST, "stop", "-t", "5", container_name],
-            capture_output=True,
-            text=True,
-        )
-        subprocess.run(
-            [docker_binary, "--host", self.settings.DOCKER_HOST, "rm", "-f", container_name],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            subprocess.run(
+                [docker_binary, "--host", self.settings.DOCKER_HOST, "stop", "-t", "5", target],
+                capture_output=True,
+                text=True,
+                **command_options,
+            )
+            removed = subprocess.run(
+                [docker_binary, "--host", self.settings.DOCKER_HOST, "rm", "-f", target],
+                capture_output=True,
+                text=True,
+                **command_options,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            if not confirm_stopped:
+                raise
+            raise NodeRuntimeError("Could not remove the Docker container during lab cleanup.") from exc
+        if confirm_stopped:
+            reason = removed.stderr.lower()
+            if removed.returncode and "no such container" not in reason and "no such object" not in reason:
+                raise NodeRuntimeError("Could not remove the Docker container during lab cleanup.")
 
         # US-203: sweep veth host-ends owned by this container. The peer end
         # was renamed into the container netns and is destroyed when the
@@ -5610,12 +6119,38 @@ class NodeRuntimeService:
                 continue
         return ids
 
-    def _stop_iol_runtime(self, runtime: dict[str, Any]) -> None:
+    def _stop_iol_runtime(self, runtime: dict[str, Any], *, confirm_stopped: bool = False) -> None:
         from app.services.runtime.iol import IolLauncher
 
+        processes = []
+        stop_record = runtime
+        if confirm_stopped:
+            if not runtime.get("pid"):
+                raise NodeRuntimeError("IOL runtime has no process identity to verify.")
+            stop_record = runtime.copy()
+            for pid_key, time_key in (("pid", "pid_create_time"), ("ubridge_pid", "ubridge_create_time")):
+                if not runtime.get(pid_key):
+                    continue
+                pid = runtime[pid_key]
+                expected = runtime.get(time_key)
+                process = self._cleanup_process(pid, expected)
+                if process is None:
+                    stop_record[pid_key] = None
+                    continue
+                if expected is None:
+                    if not IolLauncher.owns_live_process(pid):
+                        raise NodeRuntimeError("Could not verify the IOL or uBridge process identity.")
+                    expected = process.create_time()
+                    with self._lock:
+                        runtime[time_key] = expected
+                        self._persist_runtime(runtime)
+                processes.append((pid, expected))
+
         try:
-            IolLauncher.stop_runtime(runtime)
+            IolLauncher.stop_runtime(stop_record)
         except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+            if confirm_stopped:
+                raise NodeRuntimeError("Could not stop the IOL or uBridge process.") from exc
             _logger.warning(
                 "iol.stop.failed",
                 extra={
@@ -5625,6 +6160,8 @@ class NodeRuntimeService:
                     "error": str(exc),
                 },
             )
+        for pid, expected in processes:
+            self._confirm_process_exit(pid, expected)
         for tap in runtime.get("tap_names", []) or []:
             host_net.try_link_del(tap)
         self._unregister_pid(runtime.get("pid"))
@@ -5668,21 +6205,21 @@ class NodeRuntimeService:
         # resolver handles both stem and full-filename forms.
         template = self._resolve_template_for_node(node)
         template = dict(template)  # shallow copy — we may overlay extras
-        node_image = node.get("image")
-        if node_image:
-            template["image"] = node_image
         extras = _node_extras(node)
         # ``slot0..slot6`` covers both c3725 (3 bays) and c7200 (7 bays).
         # Without forwarding slotN>0, network modules selected in the
         # NodeConfigModal never reach the launcher and IOS doesn't see them.
         slot_keys = tuple(f"slot{i}" for i in range(7))
         for key in (
-            "platform", "image", "ram", "idlepc", "idle_pc", "npe", "disk0",
+            "platform", "image", "ram", "idlepc", "idle_pc", "npe", "nvram", "midplane", "disk0",
             *slot_keys,
         ):
             value = extras.get(key)
-            if value:
+            if value or (key in slot_keys and key in extras):
                 template[key] = value
+        node_image = node.get("image")
+        if node_image:
+            template["image"] = node_image
 
         provisioned_taps: list[str] = []
         # Driver-by-interface lookup for the closure below — keyed off the
@@ -5733,6 +6270,7 @@ class NodeRuntimeService:
                 node_pid=0,
                 listen_port=console_port,
                 target_port=int(launcher_record["console_internal_port"]),
+                log_id=host_net.console_proxy_log_id(lab_id, node_id),
             )
         except Exception:
             # If the proxy fails to start, tear the VM back down so the
@@ -5766,7 +6304,7 @@ class NodeRuntimeService:
         }
         return runtime
 
-    def _stop_dynamips_runtime(self, runtime: dict[str, Any]) -> None:
+    def _stop_dynamips_runtime(self, runtime: dict[str, Any], *, confirm_stopped: bool = False) -> None:
         from app.services.runtime.dynamips import DynamipsError, DynamipsLauncher
 
         proxy_pid = runtime.get("console_proxy_pid")
@@ -5785,8 +6323,14 @@ class NodeRuntimeService:
                 )
 
         try:
-            DynamipsLauncher.instance().stop_node(runtime)
+            launcher = DynamipsLauncher.instance()
+            if confirm_stopped:
+                launcher.stop_node(runtime, confirm_stopped=True)
+            else:
+                launcher.stop_node(runtime)
         except DynamipsError as exc:
+            if confirm_stopped:
+                raise NodeRuntimeError(str(exc)) from exc
             _logger.warning(
                 "dynamips.stop.failed",
                 extra={
@@ -6048,8 +6592,22 @@ class NodeRuntimeService:
         freed when the node stops.
         """
         lo, hi = _console_port_range(console_mode)
-        for port in range(lo, hi + 1):
-            if self._port_available(port, "0.0.0.0"):
+        scope = getattr(self._console_port_scope, "ports", None)
+        with self._lock:
+            # A listener may still be opening after runtime publication.
+            claimed = self._reserved_console_ports | {
+                port
+                for key, runtime in self._registry.items()
+                if key not in self._observed_inactive
+                for port in (runtime.get("console_port"), runtime.get("second_console_port"))
+                if type(port) is int
+            }
+            for port in range(lo, hi + 1):
+                if port in claimed or not self._port_available(port, "0.0.0.0"):
+                    continue
+                if scope is not None:
+                    self._reserved_console_ports.add(port)
+                    scope.add(port)
                 return port
         raise NodeRuntimeError(
             f"No {console_mode} console ports available in {lo}-{hi}."

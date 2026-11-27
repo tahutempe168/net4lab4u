@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import uuid
@@ -33,32 +34,43 @@ from app.schemas.node import (
     validate_second_console_mode_for_type,
 )
 from app.schemas.user import UserRead
+from app.services.async_utils import notify_after_mutation, run_mutation, wait_for_mutation
 from app.services.guacamole_db_service import GuacamoleDatabaseError, GuacamoleDatabaseService
 from app.services.console_recording import get_console_recorder, lab_recordings_dir, recording_lab_id
 from app.services import audit_service
 from app.services.html5_service import Html5SessionError, Html5SessionService
-from app.services.lab_lock import lab_lock_async
+from app.services.lab_paths import find_runtime_lab_path, publish_runtime_event
 from app.services.lab_service import (
+    HIGH_WATER_FIELDS,
     LEGACY_SCHEMA_ERROR,
+    LabIdExhaustedError,
+    LabMembershipPathError,
     LabService,
     _lab_file_path,
+    _labs_dir,
     _normalize_relative_lab_path,
+    allocate_network_id,
+    allocate_node_id,
+    build_relative_lab_path,
+    lab_membership_lock,
     locked_lab_async,
-    unlink_lab_file,
 )
 from app.services.network_service import NetworkServiceError, network_service
 from app.services.cloud_inventory_service import SharedCloudReferenceError
-from app.services.shared_network_service import (
-    assert_no_external_members_for_scope,
-    patch_violation,
-)
+from app.services.shared_network_service import patch_violation
 from app.services.node_runtime_service import NodeRuntimeError, NodeRuntimeService
 from app.services.template_service import (
+    DYNAMIPS_ETHERNET_ONLY,
     TemplateError,
     TemplateService,
     _custom_icon_filename,
     _icon_filename_for,
+    _validate_interface_naming,
+    dynamips_nvram_size,
+    dynamips_port_layout,
     normalize_paired_child_kind,
+    paired_child_iface_index,
+    paired_dynamips_config,
     render_interface_name,
 )
 from app.services.ws_hub import ws_hub
@@ -89,6 +101,12 @@ def _legacy_schema_response(error: LegacyLabSchemaError) -> dict:
 
 def _json_error(status_code: int, content: dict) -> JSONResponse:
     return JSONResponse(status_code=status_code, content=content)
+
+
+def _id_exhausted_response(exc: LabIdExhaustedError) -> JSONResponse:
+    """The lab has used every id of a kind the host layer can name (#332)."""
+    return _json_error(exc.code, {"code": exc.code, "status": "fail", "message": exc.message})
+
 
 NODE_FIELDS_EDITABLE_WHILE_RUNNING = {"name", "icon", "left", "top", "interface_naming_scheme"}
 NODE_FIELDS_EDITABLE_WHILE_STOPPED = {"image", "cpu", "ram", "ethernet", "console", "second_console", "delay", "extras"}
@@ -267,7 +285,7 @@ def _default_interfaces(
     Priority (highest first):
     1. ``interface_naming_scheme`` — node-level override (US-105)
     2. Template-level format string or explicit names
-    3. Hard-coded fallback: ``Gi{port}`` for qemu, ``eth{n}`` for everything else
+    3. Neutral ``eth{n}`` fallback
     """
     interfaces = []
     template_naming = template_interface_naming or {}
@@ -283,8 +301,6 @@ def _default_interfaces(
             and isinstance(explicit_names[index], str)
         ):
             name = explicit_names[index]
-        elif node_type == "qemu":
-            name = f"Gi{index + 1}"
         else:
             name = f"eth{index}"
         interfaces.append({
@@ -446,6 +462,50 @@ def _node_position(index: int, left: int, top: int, placement: str) -> tuple[int
     return left + ((index % columns) * 180), top + ((index // columns) * 140)
 
 
+def _node_create_config(request: NodeCreate | NodeBatchCreate, template) -> tuple[int, dict]:
+    ethernet = request.ethernet if "ethernet" in request.model_fields_set else template.ethernet
+    template_extras = TemplateService().template_extras(request.type, request.template)
+    extras = {**template_extras, **request.extras}
+    if request.type == "dynamips":
+        platform = str(template_extras.get("platform") or "c7200").lower()
+        if str(extras.get("platform") or platform).lower() != platform:
+            raise TemplateError("Choose a template and image for the desired Dynamips platform.")
+        extras["platform"] = platform
+        extras[DYNAMIPS_ETHERNET_ONLY] = True
+        dynamips_nvram_size(extras)
+        ethernet = len(dynamips_port_layout(extras))
+    return ethernet, extras
+
+
+def _validate_dynamips_edit(data: dict, node: dict, extras: dict) -> int | None:
+    existing = node.get("extras") or {}
+    if str(extras.get("platform") or "c7200").lower() != str(existing.get("platform") or "c7200").lower():
+        raise TemplateError("Choose a new template and image to change the Dynamips platform.")
+    if extras.get("nvram") != existing.get("nvram"):
+        dynamips_nvram_size(extras)
+    layout_fields = {key for key in existing.keys() | extras.keys() if re.fullmatch(r"slot[0-9]+", key)}
+    extras.pop(DYNAMIPS_ETHERNET_ONLY, None)
+    if existing.get(DYNAMIPS_ETHERNET_ONLY) is True:
+        extras[DYNAMIPS_ETHERNET_ONLY] = True
+    if all(existing.get(key) == extras.get(key) for key in layout_fields):
+        return None
+
+    extras[DYNAMIPS_ETHERNET_ONLY] = True
+    new_ports = dynamips_port_layout(extras)
+    connected = {
+        int(end.get("interface_index", 0))
+        for link in data.get("links") or []
+        for end in (link.get("from") or {}, link.get("to") or {})
+        if end.get("node_id") is not None and int(end["node_id"]) == int(node["id"])
+    }
+    if connected:
+        old_ports = dynamips_port_layout(existing, validate_slots=False)
+        for index in sorted(connected):
+            if index < 0 or index >= min(len(old_ports), len(new_ports)) or old_ports[index] != new_ports[index]:
+                raise TemplateError(f"Disconnect interface {index} before changing its Dynamips slot binding.")
+    return len(new_ports)
+
+
 def _build_node_payload(
     *,
     lab_id: str = "",
@@ -455,12 +515,11 @@ def _build_node_payload(
     name: str,
     left: int,
     top: int,
+    config: tuple[int, dict] | None = None,
 ) -> dict:
     provided_fields = request.model_fields_set
-    ethernet = request.ethernet if "ethernet" in provided_fields else template.ethernet
-    template_extras = TemplateService().template_extras(request.type, request.template)
-    request_extras = dict(getattr(request, "extras", None) or {})
-    merged_extras = {**template_extras, **request_extras}
+    ethernet, extras = config if config is not None else _node_create_config(request, template)
+    merged_extras = dict(extras)
     icon = request.icon
     if icon is None:
         # An empty override follows the template's current custom artwork.
@@ -541,24 +600,42 @@ async def create_lab(
     db: AsyncSession = Depends(get_db),
 ):
     lab_service = LabService(db)
+    requested_path = request.path or ""
     try:
-        scoped_path = _scoped_lab_path(current_user, request.path or "", treat_as_absolute=False)
-        lab = await lab_service.create_lab(
-            owner=current_user.username,
-            name=request.name,
-            path=scoped_path,
-            filename=request.filename,
-            author=request.author,
-            description=request.description,
-            body=request.body,
-            version=request.version,
-            scripttimeout=request.scripttimeout,
-            countdown=request.countdown,
-            linkwidth=request.linkwidth,
-            grid=request.grid,
-            lock=request.lock,
-            sat=request.sat,
-        )
+        scoped_path = _scoped_lab_path(current_user, requested_path, treat_as_absolute=False)
+        try:
+            filename = build_relative_lab_path(
+                request.name,
+                path=scoped_path,
+                filename=request.filename,
+                path_is_folder=not requested_path.strip().strip("/\\"),
+            )
+        except ValueError:
+            return _json_error(
+                400,
+                {"code": 400, "status": "fail", "message": "Invalid or absent lab path."},
+            )
+        # Authorize the file's containing folder after applying filename precedence.
+        parent = filename.rpartition("/")[0]
+        if _scoped_folder_path(current_user, parent, treat_as_absolute=True) != parent:
+            raise PermissionError("Access denied.")
+        async with lab_membership_lock(filename):
+            lab, cancelled = await wait_for_mutation(asyncio.create_task(lab_service.create_lab(
+                owner=current_user.username,
+                name=request.name,
+                filename=filename,
+                locked=True,
+                author=request.author,
+                description=request.description,
+                body=request.body,
+                version=request.version,
+                scripttimeout=request.scripttimeout,
+                countdown=request.countdown,
+                linkwidth=request.linkwidth,
+                grid=request.grid,
+                lock=request.lock,
+                sat=request.sat,
+            )))
     except FileExistsError as e:
         return {
             "code": 400,
@@ -572,14 +649,17 @@ async def create_lab(
             "message": str(e),
         }
 
-    await audit_service.record(
-        "lab.create",
-        actor=current_user.username,
-        target_type="lab",
-        target_id=lab.path,
-        target_name=lab.name,
-        lab_path=lab.path,
-        lab_name=lab.name,
+    await notify_after_mutation(
+        audit_service.record(
+            "lab.create",
+            actor=current_user.username,
+            target_type="lab",
+            target_id=lab.path,
+            target_name=lab.name,
+            lab_path=lab.path,
+            lab_name=lab.name,
+        ),
+        cancelled,
     )
     return {
         "code": 200,
@@ -621,44 +701,40 @@ async def update_lab(
             "status": "fail",
             "message": str(e),
         }
-    lab = await lab_service.get_lab_by_filename(scoped_path)
+    async with lab_membership_lock(scoped_path):
+        lab = await lab_service.get_lab_by_filename(scoped_path)
+        if not lab:
+            return {"code": 404, "status": "fail", "message": "Lab does not exist (60038)."}
+        if lab.owner != current_user.username and current_user.role != "admin":
+            return {"code": 403, "status": "fail", "message": "Access denied."}
 
-    if not lab:
-        return {
-            "code": 404,
-            "status": "fail",
-            "message": "Lab does not exist (60038).",
-        }
-
-    if lab.owner != current_user.username and current_user.role != "admin":
-        return {
-            "code": 403,
-            "status": "fail",
-            "message": "Access denied.",
-        }
-
-    update_fields = request.model_dump(exclude_unset=True)
-    # #300: snapshot the fields about to change for the audit trail.
-    before = {field: getattr(lab, field) for field in update_fields if hasattr(lab, field)}
-    lab = await lab_service.update_lab(lab, **update_fields)
+        update_fields = request.model_dump(exclude_unset=True)
+        # #300: snapshot the fields about to change for the audit trail.
+        before = {field: getattr(lab, field) for field in update_fields if hasattr(lab, field)}
+        lab, cancelled = await wait_for_mutation(
+            asyncio.create_task(lab_service.update_lab(lab, locked=True, **update_fields))
+        )
     # A save that changed nothing is not an event worth a row. Description
     # and body are reported by length — that they changed is the fact.
     changes = audit_service.field_changes(
         before, {field: getattr(lab, field) for field in before}
     )
     if changes:
-        await audit_service.record(
-            "lab.update",
-            actor=current_user.username,
-            target_type="lab",
-            target_id=lab.path,
-            target_name=lab.name,
-            lab_path=lab.path,
-            lab_name=lab.name,
-            detail={
-                "changes": audit_service.text_lengths(changes, ("description", "body"))
-            },
+        await notify_after_mutation(
+            audit_service.record(
+                "lab.update",
+                actor=current_user.username,
+                target_type="lab",
+                target_id=lab.path,
+                target_name=lab.name,
+                lab_path=lab.path,
+                lab_name=lab.name,
+                detail={"changes": audit_service.text_lengths(changes, ("description", "body"))},
+            ),
+            cancelled,
         )
+    elif cancelled:
+        raise asyncio.CancelledError
     return {
         "code": 200,
         "status": "success",
@@ -829,6 +905,8 @@ async def update_topology(
                 scoped_path,
             )
 
+    await ws_hub.publish(lab.path, "topology_updated", {"revision": lab.revision})
+
     # #297: report the field patches the payload applied (see patched_nodes).
     nodes_after = data.get("nodes", {})
     networks_after = data.get("networks", {})
@@ -990,23 +1068,35 @@ async def create_node(
         }
 
     # #328: the id and the write come from the file as it is under the lock.
+    try:
+        config = _node_create_config(request, template)
+    except TemplateError as exc:
+        return {"code": 400, "status": "fail", "message": str(exc)}
+
     async with _locked_lab(scoped_path) as (lab, error):
         if error is not None:
             return error
         data = lab.data
         nodes = data.setdefault("nodes", {})
-        next_id = max((int(node_key) for node_key in nodes.keys()), default=0) + 1
+        try:
+            next_id = allocate_node_id(data)
+        except LabIdExhaustedError as exc:
+            # Unsaved, so the lab file is exactly as it was.
+            return _id_exhausted_response(exc)
         node = _build_node_payload(
             lab_id=str(data.get("id") or scoped_path),
             node_id=next_id,
             request=request,
             template=template,
+            config=config,
             name=request.name,
             left=request.left,
             top=request.top,
         )
         nodes[str(next_id)] = node
         lab.save()
+
+    await ws_hub.publish(lab.path, "node_created", {"node_id": next_id, "revision": lab.revision})
 
     # #297: covers from-template creation too — that handler delegates here.
     await audit_service.record(
@@ -1127,18 +1217,17 @@ class _PairedIfaceLookupError(ValueError):
     """
 
 
-def _resolve_iface_index(node: dict, iface_name: str) -> int:
+def _resolve_iface_index(node: dict, child: dict, iface_name: str) -> int:
     """Find the interface index by name on a paired-template child node (#202).
 
     Strict: raises :class:`_PairedIfaceLookupError` when no interface matches.
     """
     interfaces = node.get("interfaces") or []
-    for idx, iface in enumerate(interfaces):
-        if isinstance(iface, dict) and str(iface.get("name") or "") == iface_name:
-            return idx
-    available = ", ".join(
-        str(iface.get("name") or "") for iface in interfaces if isinstance(iface, dict)
-    )
+    names = [str(iface.get("name") or "") if isinstance(iface, dict) else "" for iface in interfaces]
+    index = paired_child_iface_index(child, iface_name, names)
+    if index is not None:
+        return index
+    available = ", ".join(name for name in names if name)
     raise _PairedIfaceLookupError(
         f"Paired-link references unknown interface {iface_name!r} on node "
         f"{node.get('name')!r} (available: {available or '<none>'}). "
@@ -1172,8 +1261,11 @@ def _build_paired_child_payload(
     validation, capability gates, frontend modal resolution) succeed.
     """
     child_type = normalize_paired_child_kind(child.get("kind"))
-    ethernet = int(child.get("ethernet", 1))
-    extras = dict(child.get("extras") or {})
+    if child_type == "dynamips":
+        ethernet, extras = paired_dynamips_config(child)
+    else:
+        ethernet = int(child.get("ethernet", 1))
+        extras = dict(child.get("extras") or {})
     icon_type = str(child.get("icon_type") or "router")
     icon = "" if _custom_icon_filename(child.get("icon")) else _icon_filename_for(icon_type)
 
@@ -1184,8 +1276,10 @@ def _build_paired_child_payload(
             extras["firstmac"] = _first_mac_for_node(lab_id, node_id)
 
     template_iface_naming = child.get("interface_naming")
-    if not isinstance(template_iface_naming, dict):
-        template_iface_naming = None
+    if template_iface_naming is not None:
+        template_iface_naming = _validate_interface_naming(
+            template_iface_naming, source=f"paired child {child_id!r}"
+        )
 
     interfaces = _default_interfaces(
         child_type,
@@ -1304,9 +1398,8 @@ async def create_nodes_from_paired_template(
 
         snapshot = copy.deepcopy(data)
         nodes_map = data.setdefault("nodes", {})
-        next_id = max((int(node_key) for node_key in nodes_map.keys()), default=0) + 1
 
-        child_id_to_node_id: dict[str, int] = {}
+        created_by_child: dict[str, tuple[int, dict]] = {}
 
         try:
             for index, child in enumerate(paired["nodes"]):
@@ -1323,6 +1416,7 @@ async def create_nodes_from_paired_template(
                 left, top = _node_position(
                     index, request.base_left, request.base_top, "row"
                 )
+                next_id = allocate_node_id(data)
                 payload = _build_paired_child_payload(
                     lab_id=str(data.get("id") or scoped_path),
                     node_id=next_id,
@@ -1334,11 +1428,13 @@ async def create_nodes_from_paired_template(
                     top=top,
                 )
                 nodes_map[str(next_id)] = payload
-                child_id_to_node_id[child_id] = next_id
+                created_by_child[child_id] = (next_id, child)
                 created_nodes.append(payload)
-                next_id += 1
 
             lab.save()
+        except LabIdExhaustedError as exc:
+            # Nothing was saved, so there is nothing to roll back.
+            return _id_exhausted_response(exc)
         except (ValueError, TemplateError) as exc:
             # #208-MEDIUM — bad child scalars (e.g. ``ethernet: "not-an-int"``)
             # and malformed-child entries are template defects, not server
@@ -1387,19 +1483,21 @@ async def create_nodes_from_paired_template(
                 from_iface_name = str(link.get("from_iface") or "")
                 to_iface_name = str(link.get("to_iface") or "")
 
-                from_node_id = child_id_to_node_id.get(from_child)
-                to_node_id = child_id_to_node_id.get(to_child)
-                if from_node_id is None or to_node_id is None:
+                from_created = created_by_child.get(from_child)
+                to_created = created_by_child.get(to_child)
+                if from_created is None or to_created is None:
                     raise ValueError(
                         f"Paired link references unknown child id "
                         f"({from_child!r}↔{to_child!r}) in template {request.template_key!r}."
                     )
 
+                from_node_id, from_spec = from_created
+                to_node_id, to_spec = to_created
                 from_iface_idx = _resolve_iface_index(
-                    nodes_map[str(from_node_id)], from_iface_name
+                    nodes_map[str(from_node_id)], from_spec, from_iface_name
                 )
                 to_iface_idx = _resolve_iface_index(
-                    nodes_map[str(to_node_id)], to_iface_name
+                    nodes_map[str(to_node_id)], to_spec, to_iface_name
                 )
 
                 link_payload, _network_payload, _replayed = await link_service.create_link(
@@ -1485,6 +1583,9 @@ async def create_nodes_from_paired_template(
                         "message": f"Paired link blocked by concurrent attach/detach: {exc}",
                     },
                 )
+            # A paired link between two new nodes needs an implicit network.
+            if isinstance(exc, LabIdExhaustedError):
+                return _id_exhausted_response(exc)
             if isinstance(exc, (NodeRuntimeError, host_net.HostNetError)):
                 return _json_error(
                     422,
@@ -1504,6 +1605,8 @@ async def create_nodes_from_paired_template(
             )
         # The links wrote the file after lab.save(); read what landed last.
         revision = LabService.read_meta_revision_static(lab.path)
+
+    await ws_hub.publish(lab.path, "nodes_created", {"revision": revision})
 
     # #297: one entry per object the template brought into existence.
     await audit_service.record_batch(
@@ -1598,21 +1701,30 @@ async def create_nodes_batch(
         }
 
     # #328: ids and the write come from the file as it is under the lock.
+    try:
+        config = _node_create_config(request, template)
+    except TemplateError as exc:
+        return {"code": 400, "status": "fail", "message": str(exc)}
+
     async with _locked_lab(scoped_path) as (lab, error):
         if error is not None:
             return error
         data = lab.data
         nodes = data.setdefault("nodes", {})
-        next_id = max((int(node_key) for node_key in nodes.keys()), default=0) + 1
         created_nodes = []
         for index in range(request.count):
-            node_id = next_id + index
+            try:
+                node_id = allocate_node_id(data)
+            except LabIdExhaustedError as exc:
+                # No partial batch: nothing is saved until every id is taken.
+                return _id_exhausted_response(exc)
             left, top = _node_position(index, request.left, request.top, request.placement)
             node = _build_node_payload(
                 lab_id=str(data.get("id") or scoped_path),
                 node_id=node_id,
                 request=request,
                 template=template,
+                config=config,
                 name=f"{request.name_prefix}-{index + 1}",
                 left=left,
                 top=top,
@@ -1620,6 +1732,8 @@ async def create_nodes_batch(
             nodes[str(node_id)] = node
             created_nodes.append(node)
         lab.save()
+
+    await ws_hub.publish(lab.path, "nodes_created", {"revision": lab.revision})
 
     # #297: one entry per node — each is an object that now exists.
     await audit_service.record_batch(
@@ -1794,20 +1908,37 @@ async def update_node(
 
         # #297: shallow snapshot — the trail reports only what actually changed.
         before = dict(node)
+        updates = request.model_dump(exclude_unset=True)
+        if node.get("type") == "dynamips":
+            updates.pop("ethernet", None)
+            if updates.get("extras") is not None:
+                updates["extras"] = {**old_extras, **updates["extras"]}
+            try:
+                updated_count = (
+                    _validate_dynamips_edit(data, node, updates["extras"])
+                    if updates.get("extras") is not None else None
+                )
+            except TemplateError as exc:
+                return {"code": 400, "status": "fail", "message": str(exc)}
+            if updated_count is not None:
+                updates["ethernet"] = updated_count
 
-        for field, value in request.model_dump(exclude_unset=True).items():
+        for field, value in updates.items():
             # ``second_console: null`` is meaningful — it clears the secondary
             # console (#268). Every other field keeps the skip-None behavior.
             if value is not None or field == "second_console":
                 node[field] = value
 
-        node["interfaces"] = _resize_interfaces(
-            node.get("interfaces", []),
-            node.get("type", "qemu"),
-            int(node.get("ethernet", 0)),
-        )
+        if node.get("type") != "dynamips" or "ethernet" in updates:
+            node["interfaces"] = _resize_interfaces(
+                node.get("interfaces", []),
+                node.get("type", "qemu"),
+                int(node.get("ethernet", 0)),
+            )
         _apply_first_mac_edit(before, node)
         lab.save()
+
+    await ws_hub.publish(lab.path, "node_updated", {"node_id": node_id, "revision": lab.revision})
 
     # A save that changed nothing (the edit dialog re-submits every field)
     # is not an event worth a row.
@@ -1911,6 +2042,7 @@ async def delete_node(
         ]
         lab.save()
 
+    await ws_hub.publish(lab.path, "node_deleted", {"node_id": node_id, "revision": lab.revision})
     await audit_service.record("node.delete", actor=current_user.username, **audit_context)
     return {
         "code": 200,
@@ -1929,19 +2061,13 @@ async def start_node(
 ):
     try:
         scoped_path = _scoped_lab_path(current_user, lab_path, treat_as_absolute=True)
-        data = _read_lab_data(scoped_path)
-    except FileNotFoundError:
-        return {
-            "code": 404,
-            "status": "fail",
-            "message": "Lab does not exist (60038).",
-        }
-    try:
-        # The runtime backends are synchronous and can block for tens
-        # of seconds (Dynamips IOS boot, QEMU image-copy at first boot,
-        # Docker image pull). Run them in a worker thread so the
-        # event loop stays free for the rest of the request mix.
-        await asyncio.to_thread(NodeRuntimeService().start_node, data, node_id)
+        async with _locked_lab(scoped_path) as (lab, error):
+            if error is not None:
+                return error
+            data = lab.data
+            # Keep deletion out until the worker publishes its runtime record,
+            # including when the client disconnects while starting the node.
+            _, cancelled = await run_mutation(NodeRuntimeService().start_node, data, node_id)
     except LegacyLabSchemaError as exc:
         return _legacy_schema_response(exc)
     except FileNotFoundError as e:
@@ -1963,10 +2089,13 @@ async def start_node(
             "message": str(e),
         }
 
-    await audit_service.record(
-        "node.start",
-        actor=current_user.username,
-        **audit_service.node_context(data, node_id, scoped_path),
+    await notify_after_mutation(
+        audit_service.record(
+            "node.start",
+            actor=current_user.username,
+            **audit_service.node_context(data, node_id, scoped_path),
+        ),
+        cancelled,
     )
     return {
         "code": 200,
@@ -2628,7 +2757,11 @@ async def create_network(
             return error
         data = lab.data
         networks = data.setdefault("networks", {})
-        next_id = max((int(network_key) for network_key in networks.keys()), default=0) + 1
+        try:
+            next_id = allocate_network_id(data)
+        except LabIdExhaustedError as exc:
+            # Unsaved, so the lab file is exactly as it was.
+            return _id_exhausted_response(exc)
         network = {
             "id": next_id,
             "name": request.name,
@@ -3073,7 +3206,13 @@ async def get_interface_live_mac(
     runtime_service = NodeRuntimeService()
     result = runtime_service.read_live_mac(lab_id, node_id, idx, lab_data=data)
 
-    await ws_hub.publish(
+    path = _normalize_relative_lab_path(scoped_path)
+    labs_dir = _labs_dir()
+    if await find_runtime_lab_path(labs_dir, lab_id) != path:
+        return result
+    await publish_runtime_event(
+        ws_hub,
+        labs_dir,
         lab_id,
         "interface_live_mac",
         {
@@ -3084,7 +3223,8 @@ async def get_interface_live_mac(
             "live_mac": result.get("live_mac"),
             "reason": result.get("reason"),
         },
-        rev=str(lab_id),
+        path=path,
+        rev=lab_id,
     )
 
     return result
@@ -3269,7 +3409,13 @@ async def get_lab(
             "message": str(e),
         }
     lab_service = LabService(db)
-    lab = await lab_service.get_lab_by_filename(scoped_path)
+    try:
+        lab = await lab_service.get_lab_by_filename(scoped_path)
+    except ValueError:
+        return _json_error(
+            400,
+            {"code": 400, "status": "fail", "message": "Invalid or absent lab path."},
+        )
 
     if lab:
         data = {
@@ -3299,6 +3445,7 @@ async def get_lab(
             file_revision = (file_data.get("meta") or {}).get("revision")
             if isinstance(file_revision, int):
                 data["revision"] = file_revision
+            data["defaults"] = file_data.get("defaults") or {}
         except (FileNotFoundError, NotADirectoryError, IsADirectoryError, LegacyLabSchemaError, ValueError):
             pass
         return {
@@ -3326,11 +3473,14 @@ async def get_lab(
         }
 
     relative_path = lab_path.strip("/").replace("\\", "/")
-    meta = data.get("meta", {})
+    # The branch above lists what it returns; this one passes the file's
+    # meta through, minus the server's own id bookkeeping (#332).
+    meta = {k: v for k, v in data.get("meta", {}).items() if k not in HIGH_WATER_FIELDS}
     meta["id"] = data.get("id")
     meta["filename"] = relative_path
     meta["path"] = f"/{relative_path}"
     meta["owner"] = current_user.username
+    meta["defaults"] = data.get("defaults") or {}
     meta.setdefault("shared", [])
 
     return {
@@ -3351,90 +3501,50 @@ async def delete_lab(
     try:
         scoped_path = _scoped_lab_path(current_user, lab_path, treat_as_absolute=True)
     except PermissionError as e:
-        return {
-            "code": 403,
-            "status": "fail",
-            "message": str(e),
-        }
-    lab = await lab_service.get_lab_by_filename(scoped_path)
+        return {"code": 403, "status": "fail", "message": str(e)}
 
-    if lab:
-        if lab.owner != current_user.username and current_user.role != "admin":
-            return {
-                "code": 403,
-                "status": "fail",
-                "message": "Access denied.",
-            }
-        try:
-            await lab_service.delete_lab(lab)
-        except SharedCloudReferenceError as exc:
-            return {
-                "code": 409,
-                "status": "fail",
-                "message": exc.message,
-                "data": {"references": exc.references},
-            }
-        await audit_service.record(
-            "lab.delete",
-            actor=current_user.username,
-            target_type="lab",
-            target_id=lab.path,
-            target_name=lab.name,
-            lab_path=lab.path,
-            lab_name=lab.name,
-        )
-        return {
-            "code": 200,
-            "status": "success",
-            "message": "Lab has been deleted (60023).",
-        }
-
-    # Filesystem orphan: lab.json exists in LABS_DIR but no DB row (e.g. left
-    # behind by a partial delete or imported via a non-API path). Admins may
-    # clean these up; non-admins fall back to the existing 404 response.
     try:
-        filepath = _lab_file_path(scoped_path)
-    except ValueError:
-        filepath = None
+        async with lab_membership_lock(scoped_path, ipam=True):
+            lab = await lab_service.get_lab_by_filename(scoped_path)
+            if lab is not None:
+                if lab.owner != current_user.username and current_user.role != "admin":
+                    return {"code": 403, "status": "fail", "message": "Access denied."}
+                path, name, audit_details = lab.path, lab.name, {}
+                cancelled = await lab_service.delete_lab(lab, locked=True)
+            else:
+                # An admin may remove a file imported outside the DB-backed API.
+                filepath = _lab_file_path(scoped_path)
+                if not filepath.is_file():
+                    return {"code": 404, "status": "fail", "message": "Lab does not exist (60038)."}
+                if current_user.role != "admin":
+                    return {"code": 403, "status": "fail", "message": "Access denied."}
+                cancelled = await lab_service.delete_lab_file(scoped_path)
+                path, name = f"/{scoped_path}", Path(scoped_path).stem
+                audit_details = {"detail": {"orphan": True}}
+    except SharedCloudReferenceError as e:
+        return {
+            "code": 409,
+            "status": "fail",
+            "message": e.message,
+            "data": {"references": e.references},
+        }
+    except NodeRuntimeError as e:
+        return {"code": 409, "status": "fail", "message": str(e)}
 
-    if filepath is not None and filepath.is_file():
-        if current_user.role != "admin":
-            return {
-                "code": 403,
-                "status": "fail",
-                "message": "Access denied.",
-            }
-        try:
-            assert_no_external_members_for_scope(scoped_path)
-        except SharedCloudReferenceError as exc:
-            return {
-                "code": 409,
-                "status": "fail",
-                "message": exc.message,
-                "data": {"references": exc.references},
-            }
-        await unlink_lab_file(scoped_path)
-        # A lab.json with no database row — name it by its file stem.
-        await audit_service.record(
+    await notify_after_mutation(
+        audit_service.record(
             "lab.delete",
             actor=current_user.username,
             target_type="lab",
-            target_id=f"/{scoped_path}",
-            target_name=Path(scoped_path).stem,
-            lab_path=f"/{scoped_path}",
-            detail={"orphan": True},
-        )
-        return {
-            "code": 200,
-            "status": "success",
-            "message": "Lab has been deleted (60023).",
-        }
-
-    return {
-        "code": 404,
-        "status": "fail",
-        "message": "Lab does not exist (60038).",
-    }
+            target_id=path,
+            target_name=name,
+            lab_path=path,
+            lab_name=name,
+            **audit_details,
+        ),
+        cancelled,
+    )
+    return {"code": 200, "status": "success", "message": "Lab has been deleted (60023)."}
 
 
 @router.post("/_/{lab_path:path}/move", dependencies=[LAB_ACCESS])
@@ -3455,10 +3565,9 @@ async def move_lab(
             "message": str(e),
         }
 
-    settings = get_settings()
     try:
         source = _lab_file_path(scoped_path)
-        new_relative = "/".join(part for part in [scoped_target, source.name] if part)
+        new_relative = "/".join(part for part in [scoped_target, Path(scoped_path).name] if part)
         target = _lab_file_path(new_relative)
     except ValueError as e:
         return {
@@ -3480,11 +3589,28 @@ async def move_lab(
             "message": f"Lab already exists at target: /{new_relative} (60039).",
         }
 
-    # Waits for the lock off the event loop: the body awaits the database.
-    async with lab_lock_async(_normalize_relative_lab_path(scoped_path), settings.LABS_DIR):
+    # Preserve deliberate creation of a missing directory, but do not
+    # recreate a destination ancestor that moved while this request waited.
+    target_ancestor = next(directory for directory in target.parents if directory.is_dir())
+    try:
+        original_directory = target_ancestor.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return {"code": 409, "status": "fail", "message": "The destination folder changed (60039)."}
+
+    # Re-resolve both paths under their membership locks after any folder move.
+    cancelled = False
+    async with lab_membership_lock(scoped_path, new_relative):
+        source = _lab_file_path(scoped_path)
+        target = _lab_file_path(new_relative)
         lab = await lab_service.get_lab_by_filename(scoped_path)
         if not source.is_file():
             return {"code": 404, "status": "fail", "message": "Lab does not exist (60038)."}
+        try:
+            same_directory = os.path.samestat(original_directory, target_ancestor.stat())
+        except (FileNotFoundError, NotADirectoryError):
+            same_directory = False
+        if not same_directory:
+            return {"code": 409, "status": "fail", "message": "The destination folder changed (60039)."}
         try:
             with source.open(encoding="utf-8") as lab_json:
                 data = json.load(lab_json)
@@ -3517,7 +3643,7 @@ async def move_lab(
             if lab is not None:
                 lab.filename = new_relative
                 lab.path = f"/{new_relative}"
-                await db.commit()
+                _, cancelled = await wait_for_mutation(asyncio.create_task(db.commit()))
         except (Exception, asyncio.CancelledError) as exc:
             # A previously idle console can start a recording while the DB
             # commits. Move any directory it created back with the lab.
@@ -3537,16 +3663,18 @@ async def move_lab(
                 "message": "Lab move failed (60039).",
             }
 
-    await audit_service.record(
-        "lab.move",
-        actor=current_user.username,
-        target_type="lab",
-        target_id=f"/{new_relative}",
-        # The lab row's name, falling back to the file stem for labs that
-        # have no database row (filesystem imports).
-        target_name=getattr(lab, "name", None) or source.stem,
-        lab_path=f"/{new_relative}",
-        detail={"from": f"/{scoped_path}", "to": f"/{new_relative}"},
+    await notify_after_mutation(
+        audit_service.record(
+            "lab.move",
+            actor=current_user.username,
+            target_type="lab",
+            target_id=f"/{new_relative}",
+            # The lab row's name, falling back to the file stem for imports.
+            target_name=getattr(lab, "name", None) or source.stem,
+            lab_path=f"/{new_relative}",
+            detail={"from": f"/{scoped_path}", "to": f"/{new_relative}"},
+        ),
+        cancelled,
     )
     return {
         "code": 200,

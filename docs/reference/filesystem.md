@@ -9,6 +9,8 @@ Standard locations for application state, configuration, and installed component
 | `/var/lib/nova-ve/labs/` | `nova-ve` service user | 0755 | Lab JSON files. |
 | `/var/lib/nova-ve/labs/<lab>.json` | `nova-ve` service user | 0644 (umask) | A single lab's topology. |
 | `/var/lib/nova-ve/labs/<lab>.json.lock` | `nova-ve` service user | 0644 (umask) | Cooperative write lock. |
+| `/var/lib/nova-ve/labs/.folder-namespace.lock` | `nova-ve` service user | 0644 (umask) | Coordinates folder rename and deletion with lab writes and moves. |
+| `/var/lib/nova-ve/labs/.folder-deletions/` | `nova-ve` service user | 0700 | Internal staging during folder deletion. A database failure restores the folder to its original path. |
 | `/var/lib/nova-ve/tmp/<lab>/<node-id>/` | `nova-ve` service user | 0755 | Per-node runtime state — qcow2 overlays, stdout/stderr logs, QMP sockets. |
 | `/var/lib/nova-ve/tmp/node-runtime/` | `nova-ve` service user | 0755 | Persisted per-node runtime records (`<lab>-<node>.json`). |
 | `/var/lib/nova-ve/runtime/pids.json` | `nova-ve` service user | 0644 | Registered process PIDs (survive backend restarts for re-adoption). |
@@ -21,6 +23,7 @@ Standard locations for application state, configuration, and installed component
 | `/var/lib/nova-ve/templates/<vendor>/<key>.json` | `nova-ve` service user | 0644 | One template. |
 | `/var/lib/nova-ve/www/` | `nova-ve` service user | 0755 | SvelteKit static build, served by Caddy. |
 | `/var/lib/nova-ve/import-manifest.json` | root | 0644 | Last EVE-NG importer run summary. |
+| `/run/nova-ve/dnsmasq/<bridge>/` | root | 0755 | DHCP server state for a NAT-Cloud or bridge network. The helper writes `dnsmasq.conf` and a one-time legacy lease copy; dnsmasq writes `dnsmasq.pid` and `leases`, which the backend reads. The tree is recreated on start and its leases do not survive a reboot because `/run` is tmpfs. |
 
 ## Console terminal fonts
 

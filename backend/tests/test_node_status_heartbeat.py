@@ -4,6 +4,7 @@
 
 import asyncio
 import json
+import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -119,8 +120,10 @@ async def test_docker_node_stopped_externally_triggers_reconcile(monkeypatch, tm
     # Capture WS publishes
     published = []
 
-    async def fake_publish(lab_id_arg, event_type, payload, rev=""):
-        published.append({"lab_id": lab_id_arg, "type": event_type, "payload": payload})
+    async def fake_publish(lab_id_arg, event_type, payload, rev="", *, guard, identity):
+        async with guard as valid:
+            if valid:
+                published.append({"lab_id": lab_id_arg, "type": event_type, "payload": payload})
 
     from app.services import ws_hub as ws_hub_mod
     monkeypatch.setattr(ws_hub_mod.ws_hub, "publish", fake_publish)
@@ -133,6 +136,7 @@ async def test_docker_node_stopped_externally_triggers_reconcile(monkeypatch, tm
 
     # WS event published
     assert len(published) == 1
+    assert published[0]["lab_id"] == f"{lab_id}.json"
     assert published[0]["type"] == "node_status_reconciled"
     assert published[0]["payload"]["node_id"] == node_id
     assert published[0]["payload"]["status"] == 0
@@ -181,6 +185,96 @@ async def test_no_write_when_status_matches(monkeypatch, tmp_settings):
 
 
 # ---------------------------------------------------------------------------
+# Test #373: dead workload with no status to flip → the record is still removed
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        pytest.param({"id": 1, "name": "alpine", "type": "docker", "status": 0}, id="stored-status-already-stopped"),
+        pytest.param(None, id="node-gone-from-the-lab"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_dead_node_is_removed_even_with_no_status_to_flip(monkeypatch, tmp_settings, stored):
+    """The backend's start path never writes status=2 to lab.json, so a node
+    started through the API alone reaches the heartbeat with the stored status
+    already 0 — or no longer in the lab at all. Its record must not outlive
+    its workload."""
+    lab_id = "lab-dead-noflip"
+    node_id = 1
+    nodes = (
+        {str(node_id): stored}
+        if stored
+        else {"2": {"id": 2, "name": "other", "type": "docker", "status": 2}}
+    )
+    filename = _write_lab(tmp_settings.LABS_DIR, lab_id, nodes)
+    _register_runtime(tmp_settings, lab_id, node_id, "docker", container_name="c1")
+    state_path = tmp_settings.TMP_DIR / "node-runtime" / f"{lab_id}-{node_id}.json"
+
+    _patch_settings(monkeypatch, tmp_settings)
+    monkeypatch.setattr(
+        NodeRuntimeService, "_check_alive_sync", staticmethod(lambda runtime, kind, settings: False)
+    )
+    published = []
+
+    async def fake_publish(*args, **kwargs):
+        published.append(args)
+
+    from app.services import ws_hub as ws_hub_mod
+    monkeypatch.setattr(ws_hub_mod.ws_hub, "publish", fake_publish)
+
+    lab_path = tmp_settings.LABS_DIR / filename
+    original = lab_path.read_text()
+
+    await NodeRuntimeService._run_heartbeat_cycle()
+
+    # The workload is gone, so its record is gone with it.
+    assert f"{lab_id}:{node_id}" not in NodeRuntimeService._registry
+    assert not state_path.exists()
+    # Nothing changed in the lab, so nothing was written or announced.
+    assert lab_path.read_text() == original
+    assert published == []
+
+
+@pytest.mark.asyncio
+async def test_docker_heartbeat_observes_saved_id_and_retains_stopped_container(
+    monkeypatch, tmp_settings,
+):
+    lab_id = "lab-container-rename"
+    container_id = "a" * 64
+    _write_lab(tmp_settings.LABS_DIR, lab_id, {"1": {"id": 1, "type": "docker", "status": 2}})
+    _register_runtime(
+        tmp_settings, lab_id, 1, "docker",
+        container_name="old-name", container_id=container_id,
+    )
+    _patch_settings(monkeypatch, tmp_settings)
+    running = True
+    calls = []
+
+    def docker_fixture(args, **kwargs):
+        assert args[0] == "docker-fixture"
+        calls.append(args[-1])
+        if args[-1] != container_id:
+            return subprocess.CompletedProcess(args, 1, "", "No such container")
+        return subprocess.CompletedProcess(args, 0, str(running).lower(), "")
+
+    monkeypatch.setattr("app.services.node_runtime_service.shutil.which", lambda *_: "docker-fixture")
+    monkeypatch.setattr("app.services.node_runtime_service.subprocess.run", docker_fixture)
+    service = NodeRuntimeService()
+
+    await service._run_heartbeat_cycle()
+    assert service.running_nodes_by_lab() == {lab_id: 1}
+
+    running = False
+    await service._run_heartbeat_cycle()
+    assert service.running_nodes_by_lab() == {}
+    assert json.loads(service._state_path(lab_id, 1).read_text())["container_id"] == container_id
+    assert calls == [container_id, container_id]
+
+
+# ---------------------------------------------------------------------------
 # Test: QEMU node — process alive, status=0 in lab → flips to 2
 # ---------------------------------------------------------------------------
 
@@ -208,7 +302,7 @@ async def test_qemu_node_started_externally_triggers_reconcile(monkeypatch, tmp_
 
     published = []
 
-    async def fake_publish(lab_id_arg, event_type, payload, rev=""):
+    async def fake_publish(lab_id_arg, event_type, payload, rev="", **kwargs):
         published.append({"type": event_type, "payload": payload})
 
     from app.services import ws_hub as ws_hub_mod

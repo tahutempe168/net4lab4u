@@ -15,6 +15,7 @@ against an empty lab.
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +27,8 @@ from fastapi.testclient import TestClient
 from app.dependencies import get_current_user
 from app.routers import labs
 from app.schemas.node import NodeFromPairedTemplate, NodeFromTemplate
+from app.services import host_net
+from app.services.link_service import LinkService
 from app.services.template_service import TemplateService
 
 
@@ -332,6 +335,99 @@ async def test_rolls_back_when_link_creation_fails(patched_split, monkeypatch):
     on_disk = json.loads(lab_file.read_text())
     assert on_disk["nodes"] == {}
     assert on_disk["links"] == []
+
+
+# ---- #332: a paired creation needs two node ids and one network id ----
+
+_ONE_NODE_ID_LEFT = (
+    "This lab has used all 999 node ids. Ids are never reused, "
+    "so start a new lab to add more nodes."
+)
+
+
+def _set_marks(lab_file: Path, **marks) -> None:
+    data = json.loads(lab_file.read_text())
+    data["meta"].update(marks)
+    lab_file.write_text(json.dumps(data))
+
+
+def _two_link_paired_template() -> dict:
+    """The vMX pair with a second interface on the control node, so that a
+    second link between the two is legal."""
+    template = copy.deepcopy(VMX_PAIRED_TEMPLATE)
+    control = template["nodes"][0]
+    control["ethernet"] = 2
+    control["interface_naming"] = {"explicit": ["fxp0", "fxp1"]}
+    template["links"].append(
+        {"from_node": "vcp", "from_iface": "fxp1", "to_node": "vfp", "to_iface": "em1"}
+    )
+    return template
+
+
+@pytest.mark.asyncio
+async def test_paired_create_is_refused_whole_when_both_nodes_do_not_fit(patched_split):
+    """With one node id left the pair is refused before anything is written:
+    no lone node, and no id burned."""
+    _seed_paired_template(patched_split, VMX_PAIRED_TEMPLATE)
+    lab_file = _seed_empty_lab(patched_split)
+    _set_marks(lab_file, last_node_id=998)
+    before = lab_file.read_bytes()
+
+    response = await labs.create_nodes_from_paired_template(
+        "demo.json", NodeFromPairedTemplate(template_key="juniper-vmx"), current_user=_admin()
+    )
+
+    assert (_response_status(response), _response_json(response)["message"]) == (409, _ONE_NODE_ID_LEFT)
+    assert lab_file.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_paired_create_takes_its_nodes_back_when_no_network_id_is_left(patched_split):
+    """The pair's link brings an implicit network into being. With every
+    network id used the nodes are removed again, and their ids stay used."""
+    _seed_paired_template(patched_split, VMX_PAIRED_TEMPLATE)
+    lab_file = _seed_empty_lab(patched_split)
+    _set_marks(lab_file, last_network_id=host_net.MAX_NETWORK_ID)
+
+    response = await labs.create_nodes_from_paired_template(
+        "demo.json", NodeFromPairedTemplate(template_key="juniper-vmx"), current_user=_admin()
+    )
+
+    body = _response_json(response)
+    assert (_response_status(response), body["status"]) == (409, "fail")
+    assert "network ids" in body["message"]
+    on_disk = json.loads(lab_file.read_text())
+    assert (on_disk["nodes"], on_disk["links"], on_disk["networks"]) == ({}, [], {})
+    assert on_disk["meta"]["last_node_id"] == 2
+
+
+@pytest.mark.asyncio
+async def test_paired_rollback_keeps_the_ids_its_links_used(patched_split, monkeypatch):
+    """The links are made through the link service, which re-reads the lab and
+    allocates in a copy of its own. Rolling the lab back must not free those
+    ids: the route's own copy of the lab never saw them."""
+    _seed_paired_template(patched_split, _two_link_paired_template())
+    lab_file = _seed_empty_lab(patched_split)
+    real_create_link = LinkService.create_link
+    made: list[int] = []
+
+    async def refuse_second_link(self, *args, **kwargs):
+        if made:
+            raise RuntimeError("second link refused")
+        made.append(1)
+        return await real_create_link(self, *args, **kwargs)
+
+    monkeypatch.setattr(LinkService, "create_link", refuse_second_link)
+
+    response = await labs.create_nodes_from_paired_template(
+        "demo.json", NodeFromPairedTemplate(template_key="juniper-vmx"), current_user=_admin()
+    )
+
+    assert _response_status(response) == 500
+    on_disk = json.loads(lab_file.read_text())
+    assert (on_disk["nodes"], on_disk["links"], on_disk["networks"]) == ({}, [], {})
+    marks = on_disk["meta"]
+    assert (marks["last_node_id"], marks["last_network_id"], marks["last_link_id"]) == (2, 1, 2)
 
 
 def test_http_transport_returns_422_for_bad_scalar_preflight(
@@ -856,9 +952,7 @@ def test_207_predictor_handles_interface_naming_format_string(patched_split):
 
 
 def test_207_predictor_handles_interface_naming_format_list(patched_split):
-    """The predictor must also handle the pre-normalization list shape from
-    #179 (e.g. ``format: [\"fxp0\", \"ge-0/0/{n}\"]``) — it should join and
-    render the same way the runtime does."""
+    """Preflight and creation use the same labels for a saved format list."""
     from app.services.template_service import validate_paired_template
 
     template = {
@@ -876,19 +970,43 @@ def test_207_predictor_handles_interface_naming_format_list(patched_split):
         ],
     }
     assert validate_paired_template(template) is None
+    child = template["nodes"][0]
+    payload = labs._build_paired_child_payload(
+        node_id=7, template_key="list-format", child=child,
+        child_id="a", name="A", left=0, top=0,
+    )
+    assert [iface["name"] for iface in payload["interfaces"]] == ["fxp0", "ge-0/0/0", "ge-0/0/1"]
+    assert labs._resolve_iface_index(payload, child, "ge-0/0/0") == 1
+
+
+def test_paired_dynamips_validates_hardware_and_uses_same_layout_at_creation():
+    from app.services.template_service import DYNAMIPS_ETHERNET_ONLY, validate_paired_template
+
+    child = {"id": "a", "kind": "dynamips", "extras": {"platform": "c3725", "slot1": "NM-4T", "slot2": "NM-1FE-TX"}}
+    template = {
+        "kind": "paired", "nodes": [child, {"id": "b", "kind": "qemu", "ethernet": 1}],
+        "links": [{"from_node": "a", "from_iface": "eth2", "to_node": "b", "to_iface": "eth0"}],
+    }
+    assert validate_paired_template(template) is None
+    payload = labs._build_paired_child_payload(
+        node_id=7, template_key="dynamips-paired", child=child,
+        child_id="a", name="A", left=0, top=0,
+    )
+    assert payload["extras"][DYNAMIPS_ETHERNET_ONLY] is True
+    assert [iface["name"] for iface in payload["interfaces"]] == ["eth0", "eth1", "eth2"]
+
+    child["extras"]["slot1"] = "PA-GE"
+    assert "PA-GE" in validate_paired_template(template)
 
 
 def test_207_predictor_overlays_explicit_onto_kind_default_base(patched_split):
     """Codex-iter2 fix: when interface_naming.explicit is shorter than
-    ethernet count, runtime overlays explicit onto a kind-default base
-    (qemu→Gi{n+1}, others→eth{n}) at positions 0..len(explicit)-1. The
-    predictor must mirror this — pre-fix it returned just the explicit
-    list and wrongly rejected links to the un-overlaid trailing
-    interfaces.
+    ethernet count, the remaining ports use neutral defaults and old links
+    can still use the former QEMU labels for those ports.
     """
     from app.services.template_service import validate_paired_template
 
-    # qemu child: ethernet=2, explicit=["mgmt0"] → ["mgmt0", "Gi2"]
+    # qemu child: ethernet=2, explicit=["mgmt0"] → ["mgmt0", "eth1"]
     template = {
         "kind": "paired",
         "nodes": [
@@ -898,7 +1016,7 @@ def test_207_predictor_overlays_explicit_onto_kind_default_base(patched_split):
              "interface_naming": {"explicit": ["mgmt0"]}},
         ],
         "links": [
-            # Link references the runtime-overlaid trailing iface "Gi2"
+            # Link uses the old label for the automatically named second port.
             {"from_node": "a", "from_iface": "Gi2",
              "to_node": "b", "to_iface": "mgmt0"},
         ],
@@ -990,22 +1108,22 @@ async def test_208a_paired_create_acquires_lab_lock_around_phases(patched_split,
     from contextlib import asynccontextmanager, contextmanager
 
     @contextmanager
-    def counting_lab_lock(lab_id, labs_dir, timeout_s=5.0):
+    def counting_lab_lock(lab_id, labs_dir, timeout_s=5.0, **options):
         acquire_count["n"] += 1
-        with real_lab_lock(lab_id, labs_dir, timeout_s=timeout_s):
+        with real_lab_lock(lab_id, labs_dir, timeout_s=timeout_s, **options):
             yield
 
     @asynccontextmanager
-    async def counting_lab_lock_async(lab_id, labs_dir, timeout_s=5.0):
+    async def counting_lab_lock_async(lab_id, labs_dir, timeout_s=5.0, **options):
         acquire_count["n"] += 1
-        async with real_lab_lock_async(lab_id, labs_dir, timeout_s=timeout_s):
+        async with real_lab_lock_async(lab_id, labs_dir, timeout_s=timeout_s, **options):
             yield
 
     # Patch the symbol everywhere the routers and services import it from.
     # The route takes the lock through lab_service.locked_lab_async (#328).
     monkeypatch.setattr("app.services.lab_service.lab_lock_async", counting_lab_lock_async)
     monkeypatch.setattr("app.services.lab_service.lab_lock", counting_lab_lock)
-    monkeypatch.setattr("app.services.link_service.lab_lock", counting_lab_lock)
+    monkeypatch.setattr("app.services.link_service.lab_lock_async", counting_lab_lock_async)
 
     response = await labs.create_nodes_from_paired_template(
         "demo.json",
@@ -1232,7 +1350,7 @@ async def test_208e_paired_iface_lookup_error_returns_422(patched_split, monkeyp
 
     real_resolve = labs_module._resolve_iface_index
 
-    def angry_resolve(node, iface_name):
+    def angry_resolve(node, _child, iface_name):
         raise labs_module._PairedIfaceLookupError(
             f"Simulated post-pre-flight defect: interface {iface_name!r} on "
             f"node {node.get('name')!r} disappeared."
@@ -1621,13 +1739,7 @@ def test_208iter3_synthetic_child_load_uses_safe_default_for_bad_scalar(patched_
 
 
 def test_207iter3_predictor_normalizes_unsupported_kind_to_qemu(patched_split):
-    """Codex re-review caught predictor/runtime drift on unsupported child
-    kinds. Runtime ``_build_paired_child_payload`` coerces any kind outside
-    ``{qemu, docker, iol, dynamips}`` to ``qemu`` (→ ``Gi{n+1}`` fallback
-    naming). Pre-fix predictor treated every non-qemu kind as ``eth{n}``,
-    so a ``kind:"weirdkind"`` child linked via ``Gi1`` was rejected by
-    pre-flight while runtime would have built ``Gi1`` cleanly. Verify the
-    pre-flight reason matches runtime now."""
+    """Older paired recipes can use the former QEMU fallback as an alias."""
     from app.services.template_service import validate_paired_template
 
     weird_template = {
@@ -1643,14 +1755,30 @@ def test_207iter3_predictor_normalizes_unsupported_kind_to_qemu(patched_split):
              "ethernet": 1, "console": "telnet"},
         ],
         "links": [
-            # ``Gi1`` is the qemu-fallback name for ethernet index 0 on a
-            # weirdkind child (which runtime coerces to qemu).
+            # This recipe predates the neutral QEMU interface names.
             {"from_node": "a", "from_iface": "Gi1", "to_node": "b", "to_iface": "Gi1"},
         ],
     }
 
     reason = validate_paired_template(weird_template)
     assert reason is None, f"Predictor drifted from runtime — got reason: {reason}"
+    child = weird_template["nodes"][0]
+    payload = labs._build_paired_child_payload(
+        node_id=7, template_key="weird-paired", child=child,
+        child_id="a", name="A", left=0, top=0,
+    )
+    assert [iface["name"] for iface in payload["interfaces"]] == ["eth0", "eth1"]
+    assert labs._resolve_iface_index(payload, child, "Gi1") == 0
+
+
+@pytest.mark.parametrize("naming", [{"format": "eth{n}"}, {"explicit": ["eth0"]}])
+def test_legacy_qemu_fallback_alias_does_not_override_template_names(naming):
+    from app.services.template_service import _paired_child_iface_names, paired_child_iface_index
+
+    child = {"kind": "qemu", "ethernet": 1, "interface_naming": naming}
+    available = _paired_child_iface_names(child)
+    assert paired_child_iface_index(child, "eth0", available) == 0
+    assert paired_child_iface_index(child, "Gi1", available) is None
 
 
 def test_207iter3_predictor_and_runtime_share_kind_normalization():
@@ -1691,10 +1819,10 @@ def test_207iter3_predictor_blank_kind_falls_back_to_qemu():
     from app.services.template_service import _paired_child_iface_names
 
     blank = {"ethernet": 2, "kind": ""}
-    assert _paired_child_iface_names(blank) == ["Gi1", "Gi2"]
+    assert _paired_child_iface_names(blank) == ["eth0", "eth1"]
 
     missing = {"ethernet": 1}
-    assert _paired_child_iface_names(missing) == ["Gi1"]
+    assert _paired_child_iface_names(missing) == ["eth0"]
 
 
 def test_208iter3_validate_paired_template_flags_bad_cpu(patched_split):

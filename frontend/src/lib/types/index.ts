@@ -159,6 +159,8 @@ export interface LabListItem {
   lock?: boolean;
   shared?: number;
   owner?: string;
+  /** Live nodes in this lab, from the runtime registry (#365). */
+  nodes_running?: number;
 }
 
 export interface FolderListing {
@@ -425,6 +427,7 @@ export interface NodeCatalogDefaults {
 export interface NodeCatalogExtraFieldOption {
   value: string;
   label?: string;
+  ethernetPorts?: number;
 }
 
 export interface NodeCatalogExtraField {
@@ -505,6 +508,7 @@ export interface NodeCatalogPairedTemplate {
 export interface NodeCatalog {
   templates: NodeCatalogTemplate[];
   paired_templates?: NodeCatalogPairedTemplate[];
+  dynamips_profiles?: Record<string, NodeCatalogExtraField[]>;
   icon_options: string[];
   icon_assets?: string[];
   create_fields: string[];
@@ -688,6 +692,7 @@ export interface LabMeta {
    * PUT /topology; distinct from the user-authored `version` field.
    */
   revision?: number;
+  defaults?: Partial<LabDefaults>;
   grid: boolean;
   lock: boolean;
   sat?: string;

@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
+# Provisioning source layout: split checkout v1
 # Copyright (c) 2026 Fahad Yousuf <fahadysf@gmail.com>
 # SPDX-License-Identifier: Apache-2.0
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
 DRY_RUN=0
 APP_OWNER="${NOVA_VE_SERVICE_USER:-${NOVA_VE_OWNER:-nova-ve}}"
 APP_GROUP="${NOVA_VE_SERVICE_GROUP:-}"
-APP_ROOT="${REPO_ROOT}"
+APP_ROOT="${NOVA_VE_REPO_DIR:-${REPO_ROOT}}"
 ENV_DIR="/etc/nova-ve"
 ENV_FILE="${ENV_DIR}/backend.env"
 FRONTEND_ROOT="${NOVA_VE_FRONTEND_ROOT:-/var/lib/nova-ve/www}"
@@ -34,6 +35,49 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+validate_provisioning_tree() {
+  local dir="${REPO_ROOT}" owner mode untrusted
+  # The installer creates a private root-owned directory under sticky /tmp.
+  while :; do
+    read -r owner mode < <(stat -c '%u %a' -- "${dir}") || return
+    if [[ "${owner}" != 0 ]] || {
+      (( (8#${mode} & 022) != 0 )) &&
+        ! { [[ "${dir}" == /tmp ]] && (( (8#${mode} & 01000) != 0 )); }
+    }; then
+      echo "Provisioning source has a writable or non-root ancestor. Run install.sh." >&2
+      return 1
+    fi
+    [[ "${dir}" == / ]] && break
+    dir="$(dirname "${dir}")"
+  done
+  untrusted="$(find "${REPO_ROOT}/deploy" \( -type l -o ! -uid 0 -o -perm /022 \) -print -quit)" || return
+  if [[ -n "${untrusted}" ]]; then
+    echo "Provisioning inputs must be owned and writable only by root. Run install.sh." >&2
+    return 1
+  fi
+}
+
+require_trusted_provisioning_source() {
+  local application_source application_commit
+  if [[ "${EUID}" -ne 0 || -z "${NOVA_VE_REPO_DIR:-}" || -z "${NOVA_VE_RELEASE_COMMIT:-}" ]]; then
+    echo "Run install.sh to prepare a trusted source and a separate application checkout." >&2
+    return 1
+  fi
+  validate_service_user "${APP_OWNER}"
+  validate_provisioning_tree || return
+  application_source="$(cd "${APP_ROOT}" && pwd -P)" || return
+  if [[ "${application_source}" == "${REPO_ROOT}" ]]; then
+    echo "Provisioning source and application checkout must be separate. Run install.sh." >&2
+    return 1
+  fi
+  application_commit="$(sudo -u "${APP_OWNER}" -H git -C "${APP_ROOT}" rev-parse --verify 'HEAD^{commit}')" || return
+  if [[ "${application_commit}" != "${NOVA_VE_RELEASE_COMMIT}" ]]; then
+    echo "Application checkout is not at the selected release. Run install.sh." >&2
+    return 1
+  fi
+  APP_ROOT="${application_source}"
+}
 
 run() {
   if [[ "${DRY_RUN}" -eq 1 ]]; then
@@ -356,6 +400,56 @@ install_nova_ve_net_helper() {
   rm -f "${sudoers_tmp}"
 }
 
+ensure_qemu_kvm_ksm() {
+  # Kernel Samepage Merging keeps hosts dense: guests share identical pages
+  # instead of each paying the full private copy. Stock Ubuntu ships the
+  # daemon off, and the qemu-kvm boot task keys off /etc/default/qemu-kvm:
+  # with the default KSM_ENABLED=AUTO on a virtualized host it forces
+  # run=0 again at every boot. Persist KSM_ENABLED=1 so the stock task does
+  # not undo us, and install the nova-ve tuner unit (measured scan rates,
+  # run last) so the scanner is on before the backend starts its first node.
+  local ksm_src="${REPO_ROOT}/deploy/scripts/nova-ve-ksm.sh"
+  local ksm_dst="/opt/nova-ve/bin/nova-ve-ksm.sh"
+  local unit_src="${REPO_ROOT}/deploy/scripts/nova-ve-ksm.service.tpl"
+  local unit_dst="/etc/systemd/system/nova-ve-ksm.service"
+  local defaults="/etc/default/qemu-kvm"
+
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    echo "+ ensure ${defaults} has KSM_ENABLED=1"
+    echo "+ install -m 0755 -o root -g root ${ksm_src} ${ksm_dst}"
+    echo "+ install -m 0644 -o root -g root ${unit_src} ${unit_dst}"
+    echo "+ systemctl daemon-reload"
+    echo "+ systemctl enable nova-ve-ksm.service"
+    echo "+ systemctl mask ksmtuned.service"
+    echo "+ systemctl restart qemu-kvm.service"
+    echo "+ systemctl restart nova-ve-ksm.service"
+    return 0
+  fi
+
+  if [[ -f "${defaults}" ]]; then
+    if grep -qE "^KSM_ENABLED=" "${defaults}"; then
+      sed -i -E "s|^KSM_ENABLED=.*|KSM_ENABLED=1|" "${defaults}"
+    else
+      printf 'KSM_ENABLED=1\n' >> "${defaults}"
+    fi
+  else
+    printf '# KSM: lab density lever; scan rates tuned by nova-ve-ksm (installed alongside).\nKSM_ENABLED=1\n' > "${defaults}"
+    chmod 0644 "${defaults}"
+  fi
+
+  install -d -o root -g root -m 0755 /opt/nova-ve/bin
+  install -m 0755 -o root -g root "${ksm_src}" "${ksm_dst}"
+  install -m 0644 -o root -g root "${unit_src}" "${unit_dst}"
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable nova-ve-ksm.service 2>/dev/null || true
+  # ksmtuned turns KSM off when memory is plentiful — the wrong shape for a
+  # lab host. Masking here keeps the tuner as the only voice on the run knob
+  # even if a later package pull reintroduces ksmtuned.
+  systemctl mask ksmtuned.service 2>/dev/null || true
+  systemctl restart qemu-kvm.service 2>/dev/null || true
+  systemctl restart nova-ve-ksm.service 2>/dev/null || true
+}
+
 reconcile_nat_cloud_runtime() {
   local helper="/opt/nova-ve/bin/nova-ve-net.py"
 
@@ -613,6 +707,11 @@ ensure_instance_id() {
 }
 
 require_target_host
+if [[ "${DRY_RUN}" -eq 0 ]]; then
+  require_trusted_provisioning_source
+  cd -- "${REPO_ROOT}"
+  unset PYTHONPATH PYTHONHOME
+fi
 ensure_service_account
 resolve_app_identity
 
@@ -1156,6 +1255,7 @@ run install -d -o "${APP_OWNER}" -g "${APP_GROUP}" -m 0755 /var/lib/nova-ve/labs
 run install -d -o "${APP_OWNER}" -g "${APP_GROUP}" -m 0700 /var/lib/nova-ve/iourc
 run chown -R "${APP_OWNER}:${APP_GROUP}" /var/lib/nova-ve
 install_nova_ve_net_helper
+ensure_qemu_kvm_ksm
 run systemctl enable docker
 run systemctl restart docker
 run usermod -aG docker "${APP_OWNER}"
@@ -1168,7 +1268,7 @@ fi
 # does NOT abort the provisioner; the install summary records the status.
 DEMO_IMAGES_STATUS_FILE=/var/lib/nova-ve/.demo-images-status
 run rm -f "${DEMO_IMAGES_STATUS_FILE}"
-DEMO_BUILD_CMD=(sudo -u "${APP_OWNER}" -H bash "${REPO_ROOT}/deploy/scripts/build-demo-images.sh")
+DEMO_BUILD_CMD=(sudo -u "${APP_OWNER}" -H bash "${APP_ROOT}/deploy/scripts/build-demo-images.sh")
 if [[ "${NOVA_VE_SKIP_DEMO_IMAGES:-0}" == "1" ]]; then
   DEMO_BUILD_CMD=(env NOVA_VE_SKIP_DEMO_IMAGES=1 "${DEMO_BUILD_CMD[@]}")
 fi
@@ -1191,7 +1291,7 @@ run chown "${APP_OWNER}:${APP_GROUP}" "${DEMO_IMAGES_STATUS_FILE}" || true
 # does NOT abort the provisioner; the install summary records the status.
 PLATFORM_IMAGES_STATUS_FILE=/var/lib/nova-ve/.platform-images-status
 run rm -f "${PLATFORM_IMAGES_STATUS_FILE}"
-PLATFORM_BUILD_CMD=(sudo -u "${APP_OWNER}" -H env NOVA_VE_PLATFORM_MODE=auto bash "${REPO_ROOT}/deploy/scripts/build-platform-images.sh")
+PLATFORM_BUILD_CMD=(sudo -u "${APP_OWNER}" -H env NOVA_VE_PLATFORM_MODE=auto bash "${APP_ROOT}/deploy/scripts/build-platform-images.sh")
 if [[ "${NOVA_VE_SKIP_PLATFORM_IMAGES:-0}" == "1" ]]; then
   PLATFORM_BUILD_CMD=(env NOVA_VE_SKIP_PLATFORM_IMAGES=1 "${PLATFORM_BUILD_CMD[@]}")
 fi
@@ -1212,13 +1312,22 @@ ensure_instance_id
 
 ensure_database
 
-run "${PYTHON_BIN}" -m venv "${REPO_ROOT}/backend/.venv"
-run "${REPO_ROOT}/backend/.venv/bin/pip" install --upgrade pip
-run "${REPO_ROOT}/backend/.venv/bin/pip" install -r "${REPO_ROOT}/backend/requirements.txt"
+app_python="${APP_ROOT}/backend/.venv/bin/python"
+run sudo -u "${APP_OWNER}" -H "${PYTHON_BIN}" -m venv "${APP_ROOT}/backend/.venv"
+run sudo -u "${APP_OWNER}" -H "${app_python}" -m pip install --upgrade pip
+run sudo -u "${APP_OWNER}" -H "${app_python}" -m pip install -r "${APP_ROOT}/backend/requirements.txt"
 
-run "${REPO_ROOT}/deploy/scripts/run-migrations.sh"
-run "${REPO_ROOT}/deploy/scripts/run-seed.sh"
-run "${REPO_ROOT}/deploy/scripts/build-frontend.sh"
+run_app_backend() {
+  # The service manager reads the same protected environment as the backend.
+  run systemd-run --quiet --wait --pipe --collect --expand-environment=no \
+    --uid="${APP_OWNER}" --gid="${APP_GROUP}" --working-directory="${APP_ROOT}/backend" \
+    --property="EnvironmentFile=${ENV_FILE}" -- "$@"
+}
+
+run_app_backend "${app_python}" -m alembic upgrade head
+run_app_backend "${app_python}" -m scripts.seed
+run sudo -u "${APP_OWNER}" -H env NOVA_VE_FRONTEND_ROOT="${FRONTEND_ROOT}" \
+  bash "${APP_ROOT}/deploy/scripts/build-frontend.sh"
 run "${GUACAMOLE_COMPOSE_SCRIPT}"
 
 render_template "${CADDY_TEMPLATE}" /etc/caddy/Caddyfile

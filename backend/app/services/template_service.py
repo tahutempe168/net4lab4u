@@ -47,14 +47,6 @@ def normalize_paired_child_kind(raw: Any) -> str:
     return kind
 
 
-def _kind_default_iface_names(kind: str, ethernet: int) -> list[str]:
-    """Hardcoded fallback interface names by node kind. Mirrors the qemu
-    branch and ``eth{n}`` else-branch in ``_default_interfaces``."""
-    if kind == "qemu":
-        return [f"Gi{i + 1}" for i in range(ethernet)]
-    return [f"eth{i}" for i in range(ethernet)]
-
-
 def _paired_child_iface_names(child: dict[str, Any]) -> list[str]:
     """Predict the interface names a paired child will have at creation
     time. Used by :func:`validate_paired_template` to pre-flight link
@@ -67,26 +59,23 @@ def _paired_child_iface_names(child: dict[str, Any]) -> list[str]:
     1. Build the base interface list:
        a. ``interface_naming.format`` (string or list[str]) → per-index
           via :func:`render_interface_name`, OR
-       b. Hardcoded fallback by kind (qemu→``Gi{n+1}``, others→``eth{n}``).
+       b. Neutral ``eth{n}`` fallback.
     2. Overlay ``interface_naming.explicit:[name0, name1, ...]`` onto
        positions ``0..len(explicit)-1`` of the base.
 
     Codex-iter2 fix: previously this returned the explicit list verbatim,
     so a child with ``ethernet=2, explicit=["mgmt0"]`` was predicted as
-    ``["mgmt0"]`` and any link to the second interface (``Gi2``/``eth1``)
+    ``["mgmt0"]`` and any link to the second interface (``eth1``)
     was wrongly flagged invalid. The runtime overlays explicit onto a
     full-length base, so the predictor must too.
     """
-    ethernet = int(child.get("ethernet", 1))
-    # #207 codex-iter3 — must mirror runtime kind coercion exactly. Runtime
-    # coerces any unsupported kind to ``qemu`` (→ ``Gi*`` naming); pre-fix
-    # predictor treated every non-qemu kind as ``eth*``, so a link to
-    # ``Gi1`` on a ``kind:"weirdkind"`` child was wrongly flagged invalid.
-    kind = normalize_paired_child_kind(child.get("kind"))
+    if normalize_paired_child_kind(child.get("kind")) == "dynamips":
+        ethernet, _ = paired_dynamips_config(child)
+    else:
+        ethernet = int(child.get("ethernet", 1))
     iface_naming = child.get("interface_naming") if isinstance(child.get("interface_naming"), dict) else None
 
-    # Step 1 — base list (format if present, else kind-default).
-    base: list[str]
+    base = [f"eth{i}" for i in range(ethernet)]
     if iface_naming is not None:
         fmt = iface_naming.get("format")
         if isinstance(fmt, str) and fmt.strip():
@@ -97,15 +86,8 @@ def _paired_child_iface_names(child: dict[str, Any]) -> list[str]:
             # runtime; the predictor sees raw template JSON so normalize
             # here too.
             normalized = ",".join(str(item).strip() for item in fmt if str(item).strip())
-            base = (
-                [render_interface_name(normalized, i) for i in range(ethernet)]
-                if normalized
-                else _kind_default_iface_names(kind, ethernet)
-            )
-        else:
-            base = _kind_default_iface_names(kind, ethernet)
-    else:
-        base = _kind_default_iface_names(kind, ethernet)
+            if normalized:
+                base = [render_interface_name(normalized, i) for i in range(ethernet)]
 
     # Step 2 — overlay explicit names onto the front of the base list.
     if iface_naming is not None:
@@ -118,6 +100,22 @@ def _paired_child_iface_names(child: dict[str, Any]) -> list[str]:
                     base[idx] = name
 
     return base
+
+
+def paired_child_iface_index(child: dict, name: str, available: list[str]) -> int | None:
+    """Resolve an exact name or the former QEMU fallback for the same port."""
+    if name and name in available:
+        return available.index(name)
+    naming = child.get("interface_naming") or {}
+    if normalize_paired_child_kind(child.get("kind")) != "qemu" or naming.get("format"):
+        return None
+    explicit = naming.get("explicit") or []
+    for idx, label in enumerate(available):
+        if idx < len(explicit) and isinstance(explicit[idx], str):
+            continue
+        if label == f"eth{idx}" and name == f"Gi{idx + 1}":
+            return idx
+    return None
 
 
 _PAIRED_CHILD_INT_FIELDS: tuple[tuple[str, int], ...] = (
@@ -164,6 +162,15 @@ def _safe_paired_child_int(child: dict[str, Any], field: str, default: int) -> i
         return default
 
 
+def _safe_paired_ethernet_count(child: dict[str, Any]) -> int:
+    if normalize_paired_child_kind(child.get("kind")) == "dynamips":
+        try:
+            return paired_dynamips_config(child)[0]
+        except (TemplateError, TypeError, ValueError):
+            pass
+    return _safe_paired_child_int(child, "ethernet", 1)
+
+
 def validate_paired_template(data: dict[str, Any]) -> str | None:
     """Pre-flight a paired template (#207). Returns ``None`` when the template
     can be instantiated end-to-end, or a human-readable reason string when a
@@ -195,6 +202,8 @@ def validate_paired_template(data: dict[str, Any]) -> str | None:
             child_iface = child.get("interface_naming")
             if child_iface is not None:
                 _validate_interface_naming(child_iface, source=child_source)
+            if child_kind == "dynamips":
+                paired_dynamips_config(child)
             _validate_capabilities(
                 child.get("capabilities"), child_kind, source=child_source
             )
@@ -221,7 +230,7 @@ def validate_paired_template(data: dict[str, Any]) -> str | None:
                     f"child {child_id!r} has malformed scalar field "
                     f"(ethernet must be an int): {exc}"
                 )
-            if iface_name not in available:
+            if paired_child_iface_index(child, iface_name, available) is None:
                 return (
                     f"child {child_id!r} interface {iface_name!r} not in available "
                     f"set [{', '.join(available) or '<empty>'}]. Add "
@@ -404,8 +413,6 @@ DYNAMIPS_C3725_SLOT_OPTIONS = [
     {"value": "NM-1FE-TX", "label": "NM-1FE-TX"},
     {"value": "NM-4T", "label": "NM-4T (4 serial)"},
     {"value": "NM-16ESW", "label": "NM-16ESW (16-port switch)"},
-    {"value": "NM-1E", "label": "NM-1E"},
-    {"value": "NM-4E", "label": "NM-4E"},
 ]
 
 DYNAMIPS_C7200_SLOT_OPTIONS = [
@@ -428,6 +435,33 @@ DYNAMIPS_C7200_SLOT_OPTIONS = [
 # _dynamips_extras_schema so the UI and the importer stay in sync when
 # we add a new platform or increase slot count.
 _DYNAMIPS_PLATFORM_MAX_SLOTS: dict[str, int] = {"c3725": 3, "c7200": 7}
+
+# Saved blank slot 0 values historically inherited the c7200 I/O card.
+# Use a distinct value when a user explicitly removes the card.
+DYNAMIPS_NO_IO_CARD = "none"
+# Older labs address every NIO by its flat slot order. New layouts expose
+# Ethernet only. A saved lab keeps its ordering until a safe layout edit.
+DYNAMIPS_ETHERNET_ONLY = "dynamips_ethernet_only"
+_DYNAMIPS_SLOT_ZERO_DEFAULT = {"c3725": "GT96100-FE", "c7200": "C7200-IO-FE"}
+
+
+def dynamips_slot_options(platform: str, index: int) -> list[dict[str, Any]]:
+    if platform == "c3725":
+        options = [
+            option for option in DYNAMIPS_C3725_SLOT_OPTIONS
+            if (option["value"] == "GT96100-FE") == (index == 0)
+        ]
+    elif index == 0:
+        options = [
+            {"value": DYNAMIPS_NO_IO_CARD, "label": "(empty)"},
+            *(option for option in DYNAMIPS_C7200_SLOT_OPTIONS if option["value"].startswith("C7200-IO-")),
+        ]
+    else:
+        options = [option for option in DYNAMIPS_C7200_SLOT_OPTIONS if not option["value"].startswith("C7200-IO-")]
+    return [
+        {**option, "ethernetPorts": _DYNAMIPS_PA_PORT_COUNT.get(option["value"], 0)}
+        for option in options
+    ]
 
 # Ethernet port count contributed by each PA/NM module.  Zero means the
 # module exists (serial, ATM, POS) but adds no Ethernet interfaces.
@@ -457,6 +491,95 @@ _DYNAMIPS_PA_PORT_COUNT: dict[str, int] = {
     "PA-A1": 0,         # ATM
     "PA-POS-OC3": 0,    # POS
 }
+
+DYNAMIPS_NIO_PORT_COUNT = {
+    **_DYNAMIPS_PA_PORT_COUNT,
+    "NM-4T": 4,
+    "PA-4T+": 4,
+    "PA-8T": 8,
+    "PA-A1": 1,
+    "PA-POS-OC3": 1,
+}
+
+
+def dynamips_slot_inventory(
+    platform: str, extras: dict[str, Any], *, validate_slots: bool = True
+) -> list[tuple[int, str]]:
+    """Resolve supported bindings, retaining the inherited slot 0 default."""
+    max_slots = _DYNAMIPS_PLATFORM_MAX_SLOTS.get(platform)
+    if max_slots is None:
+        raise TemplateError(f"Unsupported Dynamips platform {platform!r}.")
+    slot_keys = [f"slot{index}" for index in range(max_slots)]
+    if validate_slots:
+        for key, value in extras.items():
+            if value and key.startswith("slot") and key[4:].isdigit() and key not in slot_keys:
+                raise TemplateError(f"Dynamips {platform} does not have {key}.")
+    inventory = []
+    for index, key in enumerate(slot_keys):
+        adapter = str(extras.get(key) or "").strip()
+        if index == 0 and not adapter:
+            adapter = _DYNAMIPS_SLOT_ZERO_DEFAULT[platform]
+        if validate_slots:
+            allowed = {option["value"] for option in dynamips_slot_options(platform, index)}
+        else:
+            allowed = {"", DYNAMIPS_NO_IO_CARD, *DYNAMIPS_NIO_PORT_COUNT}
+        if adapter not in allowed:
+            raise TemplateError(f"Dynamips port adapter {adapter!r} is not supported in {platform} slot {index}.")
+        if adapter and adapter != DYNAMIPS_NO_IO_CARD:
+            inventory.append((index, adapter))
+    return inventory
+
+
+def dynamips_attachment_inventory(
+    inventory: list[tuple[int, str]], extras: dict[str, Any]
+) -> list[tuple[int, str]]:
+    if extras.get(DYNAMIPS_ETHERNET_ONLY) is True:
+        return [(slot, name) for slot, name in inventory if _DYNAMIPS_PA_PORT_COUNT[name]]
+    return inventory
+
+
+def dynamips_port_layout(
+    extras: dict[str, Any], *, validate_slots: bool = True
+) -> list[tuple[str, int, str, int]]:
+    """Return physical port identities in the launcher's attachment order."""
+    platform = str(extras.get("platform") or "c7200").lower()
+    inventory = dynamips_slot_inventory(platform, extras, validate_slots=validate_slots)
+    inventory = dynamips_attachment_inventory(inventory, extras)
+    return [
+        (platform, slot, adapter, port)
+        for slot, adapter in inventory
+        for port in range(DYNAMIPS_NIO_PORT_COUNT[adapter])
+    ]
+
+
+def dynamips_nvram_size(extras: dict[str, Any]) -> int | None:
+    raw_size = extras.get("nvram")
+    if raw_size in (None, ""):
+        return None
+    try:
+        size = int(raw_size)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise TemplateError("Dynamips NVRAM must be a positive size in KB.") from exc
+    if size <= 0 or isinstance(raw_size, bool) or (isinstance(raw_size, float) and size != raw_size):
+        raise TemplateError("Dynamips NVRAM must be a positive size in KB.")
+    return size
+
+
+def paired_dynamips_config(child: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    raw_extras = child.get("extras") or {}
+    if not isinstance(raw_extras, dict):
+        raise TemplateError("Dynamips paired child extras must be an object.")
+    extras = dict(raw_extras)
+    dynamips_nvram_size(extras)
+    extras.pop(DYNAMIPS_ETHERNET_ONLY, None)
+    if "ethernet" not in child:
+        extras[DYNAMIPS_ETHERNET_ONLY] = True
+        return len(dynamips_port_layout(extras)), extras
+    available = len(dynamips_port_layout(extras))
+    requested = int(child["ethernet"])
+    if not 0 <= requested <= available:
+        raise TemplateError(f"Dynamips paired child exposes {requested} interfaces but has {available} ports.")
+    return requested, extras
 
 
 def _qemu_version_options() -> list[dict[str, str]]:
@@ -730,7 +853,7 @@ def _dynamips_extras_schema(platform: str = "c7200") -> list[dict[str, Any]]:
                     "key": f"slot{index}",
                     "label": f"Slot {index}",
                     "type": "select",
-                    "options": DYNAMIPS_C3725_SLOT_OPTIONS,
+                    "options": dynamips_slot_options(platform, index),
                     "default": "GT96100-FE" if index == 0 else "",
                     "stoppedOnly": True,
                     "runtime": True,
@@ -744,7 +867,7 @@ def _dynamips_extras_schema(platform: str = "c7200") -> list[dict[str, Any]]:
                     "key": f"slot{index}",
                     "label": f"Slot {index}",
                     "type": "select",
-                    "options": DYNAMIPS_C7200_SLOT_OPTIONS,
+                    "options": dynamips_slot_options(platform, index),
                     "default": "C7200-IO-FE" if index == 0 else "",
                     "stoppedOnly": True,
                     "runtime": True,
@@ -1279,6 +1402,10 @@ class TemplateService:
             "paired_templates": self._build_paired_catalog(),
             "icon_options": icon_options,
             "icon_assets": icon_assets,
+            "dynamips_profiles": {
+                platform: _dynamips_extras_schema(platform)
+                for platform in _DYNAMIPS_PLATFORM_MAX_SLOTS
+            },
         }
 
     def _build_paired_catalog(self) -> list[dict[str, Any]]:
@@ -1309,7 +1436,7 @@ class TemplateService:
                     "image": str(child.get("image") or ""),
                     "cpu": _safe_paired_child_int(child, "cpu", 1),
                     "ram": _safe_paired_child_int(child, "ram", 1024),
-                    "ethernet": _safe_paired_child_int(child, "ethernet", 1),
+                    "ethernet": _safe_paired_ethernet_count(child),
                     # #206 — synthetic template key the child node carries on
                     # its ``template`` field once instantiated; lets the frontend
                     # cross-reference the matching catalog entry for capabilities,
@@ -1593,7 +1720,7 @@ class TemplateService:
                             ),
                             cpu=_safe_paired_child_int(child, "cpu", 1),
                             ram=_safe_paired_child_int(child, "ram", 1024),
-                            ethernet=_safe_paired_child_int(child, "ethernet", 1),
+                            ethernet=_safe_paired_ethernet_count(child),
                             console_type=child_console_type,
                             second_console=child_second_console,
                             cpulimit=_safe_paired_child_int(child, "cpulimit", 1),

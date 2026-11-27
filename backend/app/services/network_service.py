@@ -27,7 +27,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.config import get_settings
 from app.services import host_net
+from app.services.async_utils import notify_after_mutation, run_mutation
 from app.services.cloud_inventory_service import (
+    CloudNetworkRef,
     LINUX_BRIDGE_TYPE,
     bridge_dhcp_config_on,
     bridge_dhcp_enabled,
@@ -39,13 +41,16 @@ from app.services.cloud_inventory_service import (
 )
 from app.services.lab_lock import LabLockTimeout, lab_lock
 from app.services.lab_service import (
+    LabIdExhaustedError,
     LabService,
     _bridge_server_cidr,
     _cleanup_bridge_dhcp_runtime,
     _drop_bridge_guard_after_delete,
     _normalize_relative_lab_path,
+    allocate_network_id,
     keep_written_revision,
     locked_lab,
+    preview_network_id,
 )
 from app.services.link_service import _refcount, _recompute_mac_registry
 from app.services.shared_network_service import (
@@ -266,19 +271,29 @@ def _allocate_nat_cloud_cidr(networks: dict, extra_used: list[ipaddress.IPv4Netw
     )
 
 
-def _next_network_id(networks: dict) -> int:
-    return max((int(key) for key in networks if str(key).isdigit()), default=0) + 1
+def _id_exhausted(exc: LabIdExhaustedError) -> NetworkServiceError:
+    """A lab out of ids, in this service's own error type (#332)."""
+    return NetworkServiceError(exc.code, exc.message)
+
+
+def _next_network_id(data: dict) -> int:
+    """The network id the next allocation would take, refusing as it does (#332)."""
+    try:
+        return preview_network_id(data)
+    except LabIdExhaustedError as exc:
+        raise _id_exhausted(exc) from exc
 
 
 def _normalize_new_nat_cloud(
     raw_config: dict,
     lab_id: str,
-    networks: dict,
+    data: dict,
     can_open: Callable[[str], bool] | None,
 ) -> dict:
     """Full checks for a NAT-Cloud that does not exist yet."""
+    networks = data.get("networks") or {}
     # A bridge left over from a failed delete is reused, so it is no conflict.
-    own_bridge = host_net.bridge_name(lab_id, _next_network_id(networks))
+    own_bridge = host_net.bridge_name(lab_id, _next_network_id(data))
     config = _normalize_nat_cloud_config(
         raw_config,
         networks,
@@ -768,18 +783,25 @@ def _member_summaries(members: List[LabNetwork]) -> List[dict]:
     ]
 
 
-def _ensure_shared_bridge(owner: LabNetwork, bridge: str) -> None:
+def _ensure_shared_bridge(
+    owner: LabNetwork | CloudNetworkRef, bridge: str, *, require_owner: bool = False,
+) -> None:
     """Provision a shared bridge under its owner's identity if it is missing."""
     if not host_net.bridge_exists(bridge):
         try:
             host_net.bridge_add(bridge)
-        except host_net.HostNetEEXIST:
-            pass  # the other lab was opened at the same moment
+        except host_net.HostNetEEXIST as exc:
+            if host_net.bridge_fingerprint_check(bridge, owner.lab_id, owner.network_id) != "match":
+                raise host_net.HostNetBridgeOwnershipError(
+                    _bridge_ownership_message(bridge, owner.lab_id, owner.network_id)
+                ) from exc
+            return
         host_net.bridge_fingerprint_write(bridge, owner.lab_id, owner.network_id)
         return
-    if host_net.bridge_fingerprint_check(
-        bridge, owner.lab_id, owner.network_id
-    ) == "mismatch" and not reclaim_fingerprint(bridge, owner.lab_id, owner.network_id):
+    status = host_net.bridge_fingerprint_check(bridge, owner.lab_id, owner.network_id)
+    if (status == "absent" and require_owner) or (
+        status == "mismatch" and not reclaim_fingerprint(bridge, owner.lab_id, owner.network_id)
+    ):
         raise host_net.HostNetBridgeOwnershipError(
             _bridge_ownership_message(bridge, owner.lab_id, owner.network_id)
         )
@@ -789,6 +811,25 @@ def _bridge_gateway_cidr(config: dict) -> str:
     cidr = _validate_cidr(config.get("cidr"))
     gateway = _validate_ipv4(config.get("gateway"), "config.gateway")
     return f"{gateway}/{cidr.prefixlen}"
+
+
+def _current_nat_cloud_owner(data: dict, owner: CloudNetworkRef, bridge: str) -> dict:
+    """Resolve the same owner after taking its lab lock."""
+    network = (data.get("networks") or {}).get(str(owner.network_id))
+    if (
+        str(data.get("id") or owner.lab_path) != owner.lab_id
+        or not isinstance(network, dict)
+        or network.get("type") != NAT_CLOUD_TYPE
+    ):
+        raise NetworkServiceError(409, "Shared NAT-Cloud owner changed during reconciliation.")
+    config = network.get("config") or {}
+    runtime = network.get("runtime") or {}
+    if not isinstance(config, dict) or not isinstance(runtime, dict):
+        raise NetworkServiceError(409, "Shared NAT-Cloud owner has invalid bridge metadata.")
+    current_bridge = runtime.get("bridge_name") or host_net.bridge_name(owner.lab_id, owner.network_id)
+    if config.get("shared_cloud_id") or current_bridge != bridge:
+        raise NetworkServiceError(409, "Shared NAT-Cloud owner changed during reconciliation.")
+    return network
 
 
 def _serialize_network(network: dict, count: int) -> dict:
@@ -911,8 +952,10 @@ def _reconcile_qemu_nic_link_state(
         # UP, runtime.interface_attachments) to lab.json links[]. Bring the
         # host side into agreement with the JSON before we ask QEMU to
         # flip carrier — otherwise QMP set_link runs on stale TAP state.
+        host_failures = {}
         try:
-            recon = runtime_service.reconcile_qemu_node_links(lab_id, lab_data, node)
+            recon = runtime_service.reconcile_qemu_node_links(lab_id, lab_data, node, batch_host=True)
+            host_failures = recon.get("host_failures", {})
             for w in recon.get("warnings", []):
                 logger.warning(
                     "reconcile_qemu_node_links: lab=%s node=%s iface=%s reason=%s",
@@ -927,13 +970,16 @@ def _reconcile_qemu_nic_link_state(
                 lab_id,
                 node_id,
             )
+            host_failures = dict.fromkeys(range(ethernet), "Host TAP reconciliation failed.")
 
         node_connected = connected.get(node_id, set())
         for index in range(ethernet):
             up = index in node_connected
-            ok, reason = runtime_service.set_qemu_nic_link(
-                lab_id, node_id, index, up=up
-            )
+            reason = host_failures.get(index)
+            if reason:
+                ok = False
+            else:
+                ok, reason = runtime_service.set_qemu_nic_link(lab_id, node_id, index, up=up)
             entry: Dict[str, Any] = {
                 "node_id": node_id,
                 "interface_index": index,
@@ -948,7 +994,9 @@ def _reconcile_qemu_nic_link_state(
 
 
 class NetworkService:
-    def _ensure_nat_cloud_runtime(self, network: dict, bridge: str) -> bool:
+    def _ensure_nat_cloud_runtime(
+        self, network: dict, bridge: str, *, prune_owner: tuple[str, int] | None = None,
+    ) -> bool:
         """Ensure host L3/NAT/DHCP state for a ``nat_cloud`` network.
 
         Returns True when persisted runtime fields changed.
@@ -984,6 +1032,9 @@ class NetworkService:
         else:
             host_net.dnsmasq_stop(bridge)
 
+        if prune_owner is not None:
+            self._prune_nat_cloud_ipv4(bridge, gateway_cidr, prune_owner)
+
         desired = {
             "bridge_name": bridge,
             "driver": NAT_CLOUD_TYPE,
@@ -1001,6 +1052,32 @@ class NetworkService:
                 runtime[key] = value
                 changed = True
         return changed
+
+    @staticmethod
+    def _prune_nat_cloud_ipv4(bridge: str, gateway_cidr: str, owner: tuple[str, int]) -> None:
+        """Remove stale addresses only after the verified owner's setup succeeds."""
+        gateway = ipaddress.IPv4Interface(gateway_cidr)
+        try:
+            addresses = {
+                ipaddress.IPv4Interface(cidr)
+                for name, cidr in host_net.list_ipv4_addrs()
+                if name == bridge
+            }
+        except ValueError as exc:
+            raise host_net.HostNetError("Could not verify the NAT-Cloud bridge IPv4 addresses.") from exc
+        stale = addresses - {gateway}
+        if not stale:
+            return
+        if gateway not in addresses:
+            raise host_net.HostNetError("Configured NAT-Cloud gateway is missing after setup.")
+        if host_net.bridge_fingerprint_check(bridge, *owner) != "match":
+            raise host_net.HostNetBridgeOwnershipError(_bridge_ownership_message(bridge, *owner))
+        try:
+            for address in sorted(stale):
+                host_net.bridge_addr_del(bridge, str(address))
+        finally:
+            # Linux can remove secondary addresses with an old primary.
+            host_net.bridge_addr_add(bridge, gateway_cidr)
 
     def _cleanup_nat_cloud_runtime(
         self,
@@ -1026,12 +1103,13 @@ class NetworkService:
     def _ensure_bridge_dhcp_runtime(self, network: dict, bridge: str) -> bool:
         """Bring an isolated bridge's host DHCP state in line with its settings.
 
-        Restarts the server only when it is not running or its settings
-        changed. A bridge with DHCP off is touched only when something is
-        left to remove. Returns True when persisted runtime fields changed.
+        Restarts the server only when it is not running, it still uses the
+        layout from before #334, or its settings changed. A bridge with DHCP
+        off is touched only when something is left to remove. Returns True
+        when persisted runtime fields changed.
         """
         # Local import: network_info_service imports this module.
-        from app.services.network_info_service import dhcp_server_pid
+        from app.services.network_info_service import dhcp_server_layout, dhcp_server_pid
 
         config = network.get("config") or {}
         runtime = network.setdefault("runtime", {})
@@ -1045,7 +1123,12 @@ class NetworkService:
             host_net.bridge_addr_add(bridge, _bridge_server_cidr(config))
             host_net.link_up(bridge)
             pid = dhcp_server_pid(bridge)
-            if pid is None or any(applied[key] != config[key] for key in BRIDGE_DHCP_FIELDS):
+            # #334: a server that still reads its config from the data
+            # directory is drift, whatever its settings say.
+            drifted = pid is None or dhcp_server_layout(bridge) == "legacy" or any(
+                applied[key] != config[key] for key in BRIDGE_DHCP_FIELDS
+            )
+            if drifted:
                 pid = host_net.dnsmasq_start_isolated(
                     bridge, config["dhcp_server"], config["dhcp_start"], config["dhcp_end"]
                 )
@@ -1089,7 +1172,7 @@ class NetworkService:
             if config.get("dhcp") is True:
                 _check_bridge_dhcp_overlaps(
                     config["cidr"],
-                    own_bridge=host_net.bridge_name(lab_id, _next_network_id(networks)),
+                    own_bridge=host_net.bridge_name(lab_id, _next_network_id(data)),
                     can_open=can_open,
                 )
             return config
@@ -1130,7 +1213,7 @@ class NetworkService:
         networks = data.get("networks") or {}
         if network_id is None:
             lab_id = str(data.get("id") or normalized)
-            return _normalize_new_nat_cloud(raw_config, lab_id, networks, can_open)
+            return _normalize_new_nat_cloud(raw_config, lab_id, data, can_open)
 
         network = networks.get(str(network_id))
         if not isinstance(network, dict) or network.get("type") != NAT_CLOUD_TYPE:
@@ -1210,7 +1293,7 @@ class NetworkService:
         foreign_dhcp_owners: List[Tuple[int, LabNetwork, str]] = []
         dhcp_bridges: List[Dict[str, Any]] = []
 
-        with lab_lock(normalized, labs_dir):
+        with lab_lock(normalized, labs_dir, create_parent=False):
             data = LabService.read_lab_json_static(normalized)
             lab_id = str(data.get("id") or normalized)
             networks = data.get("networks") or {}
@@ -1257,10 +1340,12 @@ class NetworkService:
                         )
                         continue
                     try:
-                        owner_network = networks.get(str(owner.network_id))
-                        if isinstance(owner_network, dict):
-                            if self._ensure_nat_cloud_runtime(owner_network, owner_bridge):
-                                dirty = True
+                        owner_network = _current_nat_cloud_owner(data, owner, owner_bridge)
+                        _ensure_shared_bridge(owner, owner_bridge, require_owner=True)
+                        if self._ensure_nat_cloud_runtime(
+                            owner_network, owner_bridge, prune_owner=(owner.lab_id, owner.network_id),
+                        ):
+                            dirty = True
                         nat_cloud.append(
                             {
                                 "network_id": network_id,
@@ -1345,6 +1430,10 @@ class NetworkService:
                             })
                             continue
                         if status == "absent":
+                            if str(network.get("type", "")) == NAT_CLOUD_TYPE:
+                                raise host_net.HostNetBridgeOwnershipError(
+                                    _bridge_ownership_message(bridge, bridge_lab_id, bridge_network_id)
+                                )
                             try:
                                 host_net.bridge_fingerprint_write(
                                     bridge, bridge_lab_id, bridge_network_id
@@ -1355,15 +1444,20 @@ class NetworkService:
                     else:
                         try:
                             host_net.bridge_add(bridge)
-                        except host_net.HostNetEEXIST:
-                            pass  # another lab on this bridge got there first
-                        try:
-                            host_net.bridge_fingerprint_write(
-                                bridge, bridge_lab_id, bridge_network_id
-                            )
-                        except host_net.HostNetError:
-                            pass
-                        created.append(bridge)
+                        except host_net.HostNetEEXIST as exc:
+                            if host_net.bridge_fingerprint_check(bridge, bridge_lab_id, bridge_network_id) != "match":
+                                raise host_net.HostNetBridgeOwnershipError(
+                                    _bridge_ownership_message(bridge, bridge_lab_id, bridge_network_id)
+                                ) from exc
+                            ensured.append(bridge)
+                        else:
+                            try:
+                                host_net.bridge_fingerprint_write(
+                                    bridge, bridge_lab_id, bridge_network_id
+                                )
+                            except host_net.HostNetError:
+                                pass
+                            created.append(bridge)
                 except host_net.HostNetError as exc:
                     skipped.append({
                         "bridge": bridge,
@@ -1395,7 +1489,8 @@ class NetworkService:
                     dirty = True
                 if str(network.get("type", "")) == NAT_CLOUD_TYPE:
                     try:
-                        if self._ensure_nat_cloud_runtime(network, bridge):
+                        prune_owner = (bridge_lab_id, bridge_network_id) if member_owner is None else None
+                        if self._ensure_nat_cloud_runtime(network, bridge, prune_owner=prune_owner):
                             dirty = True
                         nat_cloud.append(
                             {
@@ -1438,12 +1533,12 @@ class NetworkService:
 
         for network_id, shared_cloud_id, owner, owner_bridge in foreign_nat_owners:
             try:
-                _ensure_shared_bridge(owner, owner_bridge)
-                with lab_lock(owner.lab_path, labs_dir):
+                with lab_lock(owner.lab_path, labs_dir, create_parent=False):
                     owner_data = LabService.read_lab_json_static(owner.lab_path)
-                    owner_network = (owner_data.get("networks") or {}).get(str(owner.network_id))
-                    if isinstance(owner_network, dict) and self._ensure_nat_cloud_runtime(
-                        owner_network, owner_bridge
+                    owner_network = _current_nat_cloud_owner(owner_data, owner, owner_bridge)
+                    _ensure_shared_bridge(owner, owner_bridge, require_owner=True)
+                    if self._ensure_nat_cloud_runtime(
+                        owner_network, owner_bridge, prune_owner=(owner.lab_id, owner.network_id),
                     ):
                         # #248: reconcile bookkeeping, not an edit.
                         LabService.write_lab_json_static(
@@ -1470,7 +1565,7 @@ class NetworkService:
 
         for network_id, owner, owner_bridge in foreign_dhcp_owners:
             try:
-                with lab_lock(owner.lab_path, labs_dir):
+                with lab_lock(owner.lab_path, labs_dir, create_parent=False):
                     owner_data = LabService.read_lab_json_static(owner.lab_path)
                     owner_network = (owner_data.get("networks") or {}).get(str(owner.network_id))
                     if bridge_dhcp_enabled(owner_network) and self._ensure_bridge_dhcp_runtime(
@@ -1522,6 +1617,37 @@ class NetworkService:
         ``shared_cloud_id``; everyone else can join only what is shared (#319).
         ``can_open`` keeps labs the caller cannot open out of conflict messages.
         """
+        # #331: the change polls two locks and then provisions the host, all
+        # of it blocking, so it runs in a worker thread.
+        payload, cancelled = await run_mutation(
+            self._create_network_locked,
+            lab_path,
+            request,
+            allow_unshared_clouds=allow_unshared_clouds,
+            can_open=can_open,
+        )
+        await notify_after_mutation(
+            ws_hub.publish(
+                _normalize_relative_lab_path(lab_path),
+                "network_created",
+                {"network": dict(payload)},
+            ), cancelled
+        )
+        return payload
+
+    def _create_network_locked(
+        self,
+        lab_path: str,
+        request: dict,
+        *,
+        allow_unshared_clouds: bool = False,
+        can_open: Callable[[str], bool] | None = None,
+    ) -> dict:
+        """Create a network in a lab and return its record.
+
+        Calls :meth:`create_network` for the event loop; this blocks until it
+        has the subnet lock and the lab lock.
+        """
         normalized = _normalize_relative_lab_path(lab_path)
         labs_dir = get_settings().LABS_DIR
 
@@ -1564,7 +1690,7 @@ class NetworkService:
             else nullcontext()
         )
         with create_lock:
-            with lab_lock(normalized, labs_dir):
+            with lab_lock(normalized, labs_dir, create_parent=False):
                 data = LabService.read_lab_json_static(normalized)
                 lab_id = str(data.get("id") or normalized)
                 networks = data.setdefault("networks", {})
@@ -1605,7 +1731,7 @@ class NetworkService:
                         normalized_config, owner_runtime = _normalize_shared_nat_cloud_config(shared_cloud_id)
                     else:
                         normalized_config = _normalize_new_nat_cloud(
-                            raw_config, lab_id, networks, can_open
+                            raw_config, lab_id, data, can_open
                         )
                         owner_runtime = {}
                 else:
@@ -1616,7 +1742,7 @@ class NetworkService:
                 if bridge_dhcp:
                     _check_bridge_dhcp_overlaps(
                         normalized_config["cidr"],
-                        own_bridge=host_net.bridge_name(lab_id, _next_network_id(networks)),
+                        own_bridge=host_net.bridge_name(lab_id, _next_network_id(data)),
                         can_open=can_open,
                     )
                 # Bridge-Cloud: host-owned bridge.  Validate config.host_bridge
@@ -1636,7 +1762,10 @@ class NetworkService:
                             "provision-ubuntu-2604.sh on the host first.",
                             extra={"host_bridge": host_bridge},
                         )
-                next_id = _next_network_id(networks)
+                try:
+                    next_id = allocate_network_id(data)
+                except LabIdExhaustedError as exc:
+                    raise _id_exhausted(exc) from exc
                 bridge = (
                     normalized_config["host_bridge"]
                     if network_type == BRIDGE_CLOUD_TYPE
@@ -1743,7 +1872,7 @@ class NetworkService:
                                 )
                             raise
                     if network_type == NAT_CLOUD_TYPE and not shared_cloud_id:
-                        self._ensure_nat_cloud_runtime(network, bridge)
+                        self._ensure_nat_cloud_runtime(network, bridge, prune_owner=(lab_id, next_id))
                     if bridge_dhcp:
                         # Rolls its own host steps back when one fails.
                         pid = _switch_bridge_dhcp(bridge, {}, normalized_config)
@@ -1801,15 +1930,27 @@ class NetworkService:
                 _recompute_mac_registry(normalized, data)
                 payload = _serialize_network(network, 0)
 
-        await ws_hub.publish(normalized, "network_created", {"network": dict(payload)})
         return payload
 
     async def delete_network(self, lab_path: str, network_id: int) -> dict:
+        # #331: as with create_network, the locks and the teardown block.
+        removed, cancelled = await run_mutation(self._delete_network_locked, lab_path, network_id)
+        await notify_after_mutation(
+            ws_hub.publish(
+                _normalize_relative_lab_path(lab_path),
+                "network_deleted",
+                {"network": removed},
+            ), cancelled
+        )
+        return removed
+
+    def _delete_network_locked(self, lab_path: str, network_id: int) -> dict:
+        """Delete a network and return its record; blocks on two locks."""
         normalized = _normalize_relative_lab_path(lab_path)
         labs_dir = get_settings().LABS_DIR
 
         with nat_cloud_ipam_lock():
-            with lab_lock(normalized, labs_dir):
+            with lab_lock(normalized, labs_dir, create_parent=False):
                 data = LabService.read_lab_json_static(normalized)
                 networks = data.get("networks", {}) or {}
                 network = networks.get(str(network_id))
@@ -1903,7 +2044,6 @@ class NetworkService:
                         if guard_kept and bridge_gone:
                             _drop_bridge_guard_after_delete(bridge, "delete_network")
 
-        await ws_hub.publish(normalized, "network_deleted", {"network": removed})
         return removed
 
     # ------------------------------------------------------------------
@@ -1950,9 +2090,9 @@ class NetworkService:
 
         with nat_cloud_ipam_lock():
             target_lab_path = _normalize_relative_lab_path(lab_path)
-            with lab_lock(target_lab_path, labs_dir):
+            with lab_lock(target_lab_path, labs_dir, create_parent=False):
                 owner_lab_path, owner_network_id = self._ipam_target(target_lab_path, network_id)
-            with lab_lock(owner_lab_path, labs_dir):
+            with lab_lock(owner_lab_path, labs_dir, create_parent=False):
                 data = LabService.read_lab_json_static(owner_lab_path)
                 networks = data.get("networks", {}) or {}
                 network = networks.get(str(owner_network_id))
@@ -2070,7 +2210,7 @@ class NetworkService:
                 target_lock_cm = (
                     nullcontext()
                     if target_lab_path == normalized
-                    else lab_lock(target_lab_path, labs_dir)
+                    else lab_lock(target_lab_path, labs_dir, create_parent=False)
                 )
             else:
                 target_lab_path = normalized
@@ -2080,9 +2220,9 @@ class NetworkService:
                 return self._release_ip_from_owner(target_lab_path, target_network_id, ip)
 
         with nat_cloud_ipam_lock():
-            with lab_lock(normalized, labs_dir):
+            with lab_lock(normalized, labs_dir, create_parent=False):
                 target_lab_path, target_network_id = self._ipam_target(normalized, network_id)
-            with lab_lock(target_lab_path, labs_dir):
+            with lab_lock(target_lab_path, labs_dir, create_parent=False):
                 return self._release_ip_from_owner(target_lab_path, target_network_id, ip)
 
     def _release_ip_from_owner(self, lab_path: str, network_id: int, ip: str) -> bool:
@@ -2369,11 +2509,31 @@ class NetworkService:
         Returns ``(payload, changed)``. Stopping is refused while another lab
         still uses the network.
         """
+        # #331: as with create_network, the locks are polled for.
+        (payload, changed), cancelled = await run_mutation(
+            self._set_sharing_locked, lab_path, network_id, shared
+        )
+        if changed:
+            await notify_after_mutation(
+                ws_hub.publish(
+                    _normalize_relative_lab_path(lab_path),
+                    "network_updated",
+                    {"network": dict(payload)},
+                ), cancelled
+            )
+        elif cancelled:
+            raise asyncio.CancelledError
+        return payload, changed
+
+    def _set_sharing_locked(
+        self, lab_path: str, network_id: int, shared: bool
+    ) -> Tuple[dict, bool]:
+        """Change a network's sharing flag; blocks on two locks."""
         normalized = _normalize_relative_lab_path(lab_path)
         labs_dir = get_settings().LABS_DIR
 
         with nat_cloud_ipam_lock():
-            with lab_lock(normalized, labs_dir):
+            with lab_lock(normalized, labs_dir, create_parent=False):
                 data = LabService.read_lab_json_static(normalized)
                 network = (data.get("networks") or {}).get(str(network_id))
                 if not isinstance(network, dict) or network.get("implicit") is True:
@@ -2397,8 +2557,6 @@ class NetworkService:
                     LabService.write_lab_json_static(normalized, data)
                 payload = _serialize_network(network, _refcount(data, int(network_id)))
 
-        if changed:
-            await ws_hub.publish(normalized, "network_updated", {"network": dict(payload)})
         return payload, changed
 
 

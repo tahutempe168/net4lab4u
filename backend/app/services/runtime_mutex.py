@@ -88,11 +88,14 @@ class RuntimeMutexContention(Exception):
         self.node_id = int(node_id)
         self.interface_index = int(interface_index)
         self.timeout = float(timeout)
-        super().__init__(
-            f"Hot-attach already in progress on (node={self.node_id}, "
-            f"iface={self.interface_index}); timed out after "
-            f"{self.timeout:.1f}s"
-        )
+        if self.interface_index == -1:
+            operation = f"Node operation already in progress on node={self.node_id}"
+        else:
+            operation = (
+                f"Hot-attach already in progress on (node={self.node_id}, "
+                f"iface={self.interface_index})"
+            )
+        super().__init__(f"{operation}; timed out after {self.timeout:.1f}s")
 
 
 class RuntimeMutexRegistry:
@@ -101,8 +104,9 @@ class RuntimeMutexRegistry:
 
     Locks are created lazily on first acquisition and never reaped — the
     set of in-flight ``(lab, node, iface)`` keys is bounded by the lab's
-    declared topology (max 999 nodes per lab × 99 interfaces per node)
-    and the cost of a stale lock is negligible.
+    declared topology (a lab accepts at most 999 node creations, because
+    ids are never reused and must fit the host's interface names (#332),
+    × 99 interfaces per node) and the cost of a stale lock is negligible.
 
     US-303 codex iter1 HIGH-2: also exposes a per-``(lab_id, node_id)``
     "node-scoped" lock for serializing PCIe slot allocation

@@ -1,11 +1,12 @@
 import ipaddress
+import asyncio
 import json
 import logging
 import os
 import shutil
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import AsyncExitStack, ExitStack, asynccontextmanager, contextmanager, nullcontext
 from pathlib import Path
 
 from sqlalchemy import select
@@ -14,9 +15,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.lab import LabMeta
 from app.services import host_net
-from app.services.cloud_inventory_service import LINUX_BRIDGE_TYPE, bridge_dhcp_enabled
+from app.services.async_utils import run_mutation, wait_for_mutation
+from app.services.cloud_inventory_service import (
+    LINUX_BRIDGE_TYPE,
+    bridge_dhcp_enabled,
+    nat_cloud_ipam_lock_async,
+)
 from app.services.console_recording import RECORDINGS_FOLDER
-from app.services.lab_lock import lab_lock, lab_lock_async
+from app.services.lab_lock import LabLockTimeout, folder_namespace_lock_async, lab_lock, lab_lock_async
+from app.services.lab_paths import FOLDER_DELETIONS, LabMembershipPathError
+from app.services.runtime_mutex import RuntimeMutexContention, runtime_mutex
 from app.services.shared_network_service import (
     assert_no_external_members_for_scope,
     is_member,
@@ -29,6 +37,10 @@ BRIDGE_CLOUD_TYPE = "bridge_cloud"
 logger = logging.getLogger(__name__)
 
 LEGACY_SCHEMA_ERROR = "Lab uses legacy schema; run scripts/migrate_lab_v1_to_v2.py"
+
+# ``meta`` keys recording the highest id handed out of each kind (#332).
+# Internal: never returned to clients.
+HIGH_WATER_FIELDS = ("last_node_id", "last_network_id", "last_link_id")
 
 # Fields that read_lab_json_static synthesises into the in-memory dict so that
 # legacy router code keeps working. They MUST be stripped before persisting.
@@ -45,7 +57,7 @@ def _normalize_relative_lab_path(raw_path: str) -> str:
     """Normalize a LABS_DIR-relative path and reject traversal."""
     candidate = raw_path.strip().replace("\\", "/").strip("/")
     parts = [part for part in candidate.split("/") if part not in {"", "."}]
-    if not parts or any(part == ".." for part in parts):
+    if not parts or any(part in {"..", FOLDER_DELETIONS} for part in parts):
         raise ValueError("Invalid lab path: directory traversal detected")
     if RECORDINGS_FOLDER in parts:
         raise ValueError("The console recordings directory is reserved.")
@@ -56,7 +68,7 @@ def _lab_file_path(relative_path: str) -> Path:
     labs_dir = _labs_dir()
     normalized_relative_path = _normalize_relative_lab_path(relative_path)
     filepath = (labs_dir / normalized_relative_path).resolve()
-    if not str(filepath).startswith(str(labs_dir)):
+    if not filepath.is_relative_to(labs_dir):
         raise ValueError("Invalid lab path: directory traversal detected")
     return filepath
 
@@ -93,6 +105,8 @@ def build_relative_lab_path(
     name: str,
     path: str | None = None,
     filename: str | None = None,
+    *,
+    path_is_folder: bool = False,
 ) -> str:
     """Build a relative lab path from API inputs."""
     if filename:
@@ -104,7 +118,7 @@ def build_relative_lab_path(
     generated_name = f"{_safe_lab_filename(name)}.json"
     if path:
         normalized_path = _normalize_relative_lab_path(path)
-        if normalized_path.endswith(".json"):
+        if not path_is_folder and normalized_path.endswith(".json"):
             return normalized_path
         return f"{normalized_path}/{generated_name}"
 
@@ -394,12 +408,56 @@ def _cleanup_lab_network_runtime(data: dict, lab_filename: str) -> None:
             _drop_bridge_guard_after_delete(bridge, "delete_lab")
 
 
+def _cleanup_lab_node_runtime(data: dict, lab_filename: str) -> Path:
+    """Confirm all node stops and return the lab's disk directory."""
+    from app.services.node_runtime_service import NodeRuntimeError, NodeRuntimeService
+
+    lab_id = str(data.get("id") or lab_filename).strip()
+    if not lab_id or "/" in lab_id or "\\" in lab_id or lab_id in {".", ".."}:
+        raise NodeRuntimeError("Lab runtime directory could not be identified.")
+
+    nodes = data.get("nodes") or {}
+    if not isinstance(nodes, dict):
+        raise NodeRuntimeError("Lab node inventory is invalid.")
+    try:
+        node_ids = {int(value) for value in nodes}
+    except (TypeError, ValueError) as exc:
+        raise NodeRuntimeError("Lab node inventory is invalid.") from exc
+
+    service = NodeRuntimeService()
+    node_ids.update(service.lab_runtime_node_ids(lab_id))
+    with ExitStack() as locks:
+        try:
+            for node_id in sorted(node_ids):
+                # Some reconcilers already hold a node lock. Never wait for
+                # that lock while holding the lab file and IPAM locks.
+                locks.enter_context(runtime_mutex.acquire_node_sync(lab_id, node_id, timeout=0))
+        except RuntimeMutexContention as exc:
+            raise LabLockTimeout("A lab node is busy. Retry the lab deletion.") from exc
+
+        for node_id in sorted(node_ids):
+            service.stop_node(data, node_id, confirm_stopped=True)
+
+    return get_settings().TMP_DIR / lab_id
+
+
 def _legacy_topology_to_links(data: dict) -> list[dict]:
     links: list[dict] = []
-    for index, entry in enumerate(data.get("topology", []) or []):
-        if not isinstance(entry, dict):
-            continue
+    topology = [entry for entry in data.get("topology") or [] if isinstance(entry, dict)]
+    # #332: ids the document already carries. A generated id skips them, and
+    # below they raise the mark so a later allocation cannot collide either.
+    taken = {str(link.get("id")) for link in data.get("links") or [] if isinstance(link, dict)}
+    taken.update(str(entry["id"]) for entry in topology if entry.get("id"))
 
+    def _identified(link: dict) -> dict:
+        if not link["id"]:
+            link["id"] = allocate_link_id(data)
+            while link["id"] in taken:
+                link["id"] = allocate_link_id(data)
+            taken.add(str(link["id"]))
+        return link
+
+    for entry in topology:
         source = str(entry.get("source", "") or "")
         destination = str(entry.get("destination", "") or "")
         source_iface = entry.get("source_interfaceId", 0) or 0
@@ -416,7 +474,7 @@ def _legacy_topology_to_links(data: dict) -> list[dict]:
         source_node_id = _node_id(source)
         destination_node_id = _node_id(destination)
         link: dict[str, object] = {
-            "id": entry.get("id") or f"lnk_{index + 1:03d}",
+            "id": entry.get("id"),
             "style_override": None,
             "label": str(entry.get("label", "") or ""),
             "color": str(entry.get("color", "") or ""),
@@ -436,13 +494,13 @@ def _legacy_topology_to_links(data: dict) -> list[dict]:
                 dst_index = 0
             link["from"] = {"node_id": source_node_id, "interface_index": int(source_iface)}
             link["to"] = {"node_id": destination_node_id, "interface_index": dst_index}
-            links.append(link)
+            links.append(_identified(link))
             continue
 
         if source_node_id is not None and network_id:
             link["from"] = {"node_id": source_node_id, "interface_index": int(source_iface)}
             link["to"] = {"network_id": network_id}
-            links.append(link)
+            links.append(_identified(link))
             continue
 
         if destination_node_id is not None and network_id:
@@ -452,9 +510,14 @@ def _legacy_topology_to_links(data: dict) -> list[dict]:
                 dst_index = 0
             link["from"] = {"node_id": destination_node_id, "interface_index": dst_index}
             link["to"] = {"network_id": network_id}
-            links.append(link)
+            links.append(_identified(link))
             continue
 
+    if links:
+        _set_high_water(
+            data, "last_link_id",
+            max(_high_water_mark(data, "last_link_id"), _max_link_number({"links": links})),
+        )
     return links
 
 
@@ -525,15 +588,195 @@ def keep_written_revision(data: dict, revision: int | None) -> None:
     meta["revision"] = revision
 
 
-async def unlink_lab_file(filename: str) -> None:
+def _max_int_key(mapping: dict) -> int:
+    highest = 0
+    for key in mapping:
+        try:
+            highest = max(highest, int(key))
+        except (TypeError, ValueError):
+            continue
+    return highest
+
+
+class LabIdExhaustedError(Exception):
+    """Every id of a kind that the host layer can name has been handed out (#332).
+
+    Ids are never reused, so this limits how often a lab can create, not how
+    many it can hold at once. ``code`` and ``message`` mirror
+    ``NetworkServiceError``.
+    """
+
+    def __init__(self, kind: str, limit: int) -> None:
+        super().__init__(
+            f"This lab has used all {limit} {kind} ids. Ids are never reused, "
+            f"so start a new lab to add more {kind}s."
+        )
+        self.code = 409
+        self.message = str(self)
+
+
+# What each mark names, and the highest id of that kind the host layer can
+# still name. ``None``: the id is a string that widens instead of overflowing.
+_ID_LIMITS = {
+    "last_node_id": ("node", host_net.MAX_NODE_ID),
+    "last_network_id": ("network", host_net.MAX_NETWORK_ID),
+    "last_link_id": ("link", None),
+}
+
+
+def _high_water_mark(data: dict, field: str) -> int:
+    """The highest id of ``field``'s kind that ``data`` records as used."""
+    meta = data.get("meta")
+    if not isinstance(meta, dict):
+        return 0
+    try:
+        return int(meta.get(field) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _set_high_water(data: dict, field: str, value: int) -> None:
+    meta = data.get("meta")
+    if not isinstance(meta, dict):
+        meta = data["meta"] = {}
+    meta[field] = value
+
+
+def _preview_high_water(data: dict, field: str, current_max: int) -> int:
+    """Next id for ``field`` without recording it.
+
+    Raises :class:`LabIdExhaustedError` when that id is past the limit, so
+    nothing is ever created that the host layer could not name.
+    """
+    value = max(current_max, _high_water_mark(data, field)) + 1
+    kind, limit = _ID_LIMITS[field]
+    if limit is not None and value > limit:
+        raise LabIdExhaustedError(kind, limit)
+    return value
+
+
+def _allocate_high_water(data: dict, field: str, current_max: int) -> int:
+    """Next id for ``field``, recorded so the id is never reused (#332).
+
+    Deleting the highest-numbered object must not free its id: a delete
+    racing a create could then remove the new object, and node work dirs
+    are keyed by id. Labs written before #332 have no high-water mark, so
+    allocation starts above the current maximum; a mark can never move
+    backwards, not even on a rollback (:func:`keep_high_water_marks`).
+    """
+    # A refused allocation raises before anything is recorded.
+    value = _preview_high_water(data, field, current_max)
+    _set_high_water(data, field, value)
+    return value
+
+
+def allocate_node_id(data: dict) -> int:
+    """Allocate a node id that this lab has never used before (#332)."""
+    return _allocate_high_water(data, "last_node_id", _max_int_key(data.get("nodes") or {}))
+
+
+def allocate_network_id(data: dict) -> int:
+    """Allocate a network id that this lab has never used before (#332)."""
+    return _allocate_high_water(
+        data, "last_network_id", _max_int_key(data.get("networks") or {})
+    )
+
+
+def preview_network_id(data: dict) -> int:
+    """The network id the next allocation in ``data`` would take (#332)."""
+    return _preview_high_water(
+        data, "last_network_id", _max_int_key(data.get("networks") or {})
+    )
+
+
+def _max_link_number(data: dict) -> int:
+    highest = 0
+    for link in data.get("links") or []:
+        if not isinstance(link, dict):
+            continue
+        link_id = str(link.get("id") or "")
+        if link_id.startswith("lnk_") and link_id[4:].isdigit():
+            highest = max(highest, int(link_id[4:]))
+    return highest
+
+
+def allocate_link_id(data: dict) -> str:
+    """Allocate a link id that this lab has never used before (#332)."""
+    return f"lnk_{_allocate_high_water(data, 'last_link_id', _max_link_number(data)):03d}"
+
+
+def keep_high_water_marks(snapshot: dict, live: dict) -> None:
+    """Carry the high-water marks of ``live`` into a ``snapshot`` about to be
+    written back.
+
+    A rollback is not an edit: freeing the ids allocated since the snapshot
+    was taken would hand them out a second time.
+    """
+    meta = live.get("meta")
+    if not isinstance(meta, dict):
+        return
+    marks = {field: meta[field] for field in HIGH_WATER_FIELDS if field in meta}
+    if not marks:
+        return
+    snapshot_meta = snapshot.get("meta")
+    if not isinstance(snapshot_meta, dict):
+        snapshot_meta = snapshot["meta"] = {}
+    for field in marks:
+        snapshot_meta[field] = max(_high_water_mark(snapshot, field), _high_water_mark(live, field))
+
+
+def _cleanup_and_unlink_lab(filename: str, data: dict) -> None:
+    """Clean up the lab while the caller holds its non-reentrant lock."""
+    assert_no_external_members_for_scope(filename)
+    work_root = _cleanup_lab_node_runtime(data, filename)
+    _cleanup_lab_network_runtime(data, filename)
+    if work_root is not None and work_root.exists():
+        shutil.rmtree(work_root)
+    _lab_file_path(filename).unlink(missing_ok=True)
+
+
+def _validate_lab_membership_path(filename: str) -> None:
+    if _lab_file_path(filename) != _labs_dir() / filename:
+        raise LabMembershipPathError("Lab changes require a canonical path.")
+
+
+async def unlink_lab_file(filename: str, *, locked: bool = False) -> None:
     """Remove a lab file under its lock (#328).
 
     A writer that read the lab before the delete finishes first; one that
     comes after re-reads under the lock, finds no file and writes nothing.
     """
     normalized = _normalize_relative_lab_path(filename)
-    async with lab_lock_async(normalized, get_settings().LABS_DIR):
+    if locked:
         _lab_file_path(normalized).unlink(missing_ok=True)
+    else:
+        async with lab_membership_lock(normalized):
+            _lab_file_path(normalized).unlink(missing_ok=True)
+
+
+@asynccontextmanager
+async def lab_membership_lock(filename: str, *other_filenames: str, ipam: bool = False):
+    """Protect path lookups and file/DB changes in IPAM, namespace, lab order."""
+    settings = get_settings()
+    paths = sorted({_normalize_relative_lab_path(path) for path in (filename, *other_filenames)})
+    async with (nat_cloud_ipam_lock_async(settings) if ipam else nullcontext()):
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(folder_namespace_lock_async(settings.LABS_DIR, shared=True))
+            for path in paths:
+                _validate_lab_membership_path(path)
+            try:
+                for path in paths:
+                    await stack.enter_async_context(
+                        lab_lock_async(path, settings.LABS_DIR, namespace=False, create_parent=False)
+                    )
+            except FileNotFoundError:
+                # A missing parent is valid for moves or ghost rows. Take
+                # exclusive namespace protection without creating a lock dir.
+                await stack.aclose()
+                await stack.enter_async_context(folder_namespace_lock_async(settings.LABS_DIR))
+                for path in paths:
+                    _validate_lab_membership_path(path)
+            yield
 
 
 class LockedLab:
@@ -555,6 +798,12 @@ class LockedLab:
 
     def restore(self, snapshot: dict) -> None:
         """Write back a copy taken under this lock. A rollback is not an edit."""
+        # Ids allocated since the snapshot stay allocated (#332): those seen
+        # here, and those a writer that borrowed this lock allocated in a
+        # copy of its own (paired-template links). The lock is held, so the
+        # file cannot change underneath the read.
+        keep_high_water_marks(snapshot, self.data)
+        keep_high_water_marks(snapshot, LabService.read_lab_json_static(self.path))
         self.data = snapshot
         self.save(bump_revision=False)
 
@@ -568,7 +817,7 @@ def locked_lab(filename: str, *, reader: Callable[[str], dict] | None = None) ->
     and no other writer can land between the read and the write.
     """
     normalized = _normalize_relative_lab_path(filename)
-    with lab_lock(normalized, get_settings().LABS_DIR):
+    with lab_lock(normalized, get_settings().LABS_DIR, create_parent=False):
         yield LockedLab(normalized, (reader or LabService.read_lab_json_static)(normalized))
 
 
@@ -581,7 +830,7 @@ async def locked_lab_async(
     Keep the body free of awaits that need this lab's lock.
     """
     normalized = _normalize_relative_lab_path(filename)
-    async with lab_lock_async(normalized, get_settings().LABS_DIR):
+    async with lab_lock_async(normalized, get_settings().LABS_DIR, create_parent=False):
         yield LockedLab(normalized, (reader or LabService.read_lab_json_static)(normalized))
 
 
@@ -609,7 +858,7 @@ class LabService:
         file was removed out-of-band can be detected.
         """
         try:
-            return _lab_file_path(filename).exists()
+            return _lab_file_path(filename).is_file()
         except ValueError:
             # Malformed/stored-attacker filename: treat as missing.
             return False
@@ -624,17 +873,18 @@ class LabService:
         orphan-QEMU sweep (#225). Returns the removed filenames.
         """
         removed: list[str] = []
-        for lab in await self.list_labs():
-            if LabService.file_exists(lab.filename):
-                continue
-            logger.warning(
-                "reconcile: lab row has no backing file — removing DB row (filename=%s)",
-                lab.filename,
-            )
-            await self.db.delete(lab)
-            removed.append(lab.filename)
-        if removed:
-            await self.db.commit()
+        async with folder_namespace_lock_async(get_settings().LABS_DIR):
+            for lab in await self.list_labs():
+                if LabService.file_exists(lab.filename):
+                    continue
+                logger.warning(
+                    "reconcile: lab row has no backing file — removing DB row (filename=%s)",
+                    lab.filename,
+                )
+                await self.db.delete(lab)
+                removed.append(lab.filename)
+            if removed:
+                await self.db.commit()
         return removed
 
     async def create_lab(
@@ -643,14 +893,13 @@ class LabService:
         name: str,
         path: str | None = None,
         filename: str | None = None,
+        *,
+        locked: bool = False,
         **meta_fields,
     ) -> LabMeta:
         """Create a new lab: DB record + JSON file."""
         lab_id = uuid.uuid4()
         relative_path = build_relative_lab_path(name=name, path=path, filename=filename)
-        filepath = _lab_file_path(relative_path)
-        if filepath.exists():
-            raise FileExistsError(f"Lab file already exists: {relative_path}")
 
         meta = {
             "name": name,
@@ -666,10 +915,6 @@ class LabService:
             "sat": meta_fields.get("sat", "-1"),
         }
         lab_json = _empty_lab_json(str(lab_id), meta)
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "w") as f:
-            json.dump(lab_json, f, indent=2)
-
         db_meta = {k: v for k, v in meta.items() if hasattr(LabMeta, k) and k != "name"}
         lab = LabMeta(
             id=lab_id,
@@ -679,18 +924,51 @@ class LabService:
             path=_api_lab_path(relative_path),
             **db_meta,
         )
-        self.db.add(lab)
-        await self.db.commit()
-        await self.db.refresh(lab)
+
+        async def write_and_commit() -> None:
+            filepath = _lab_file_path(relative_path)
+            if filepath.exists():
+                raise FileExistsError(f"Lab file already exists: {relative_path}")
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            _replace_json(filepath, lab_json)
+            self.db.add(lab)
+            await self.db.commit()
+            await self.db.refresh(lab)
+
+        if locked:
+            await write_and_commit()
+        else:
+            async with lab_membership_lock(relative_path):
+                _, cancelled = await wait_for_mutation(asyncio.create_task(write_and_commit()))
+            if cancelled:
+                raise asyncio.CancelledError
         return lab
 
     async def update_lab(
         self,
         lab: LabMeta,
+        *,
+        locked: bool = False,
         **updates,
     ) -> LabMeta:
         """Update lab metadata in both DB and JSON file."""
+        if not locked:
+            filename = lab.filename
+            async with lab_membership_lock(filename):
+                await self.db.refresh(lab)
+                if lab.filename != filename:
+                    raise FileNotFoundError(filename)
+                result, cancelled = await wait_for_mutation(
+                    asyncio.create_task(self.update_lab(lab, locked=True, **updates))
+                )
+            if cancelled:
+                raise asyncio.CancelledError
+            return result
+
         filepath = _lab_file_path(lab.filename)
+        lab_json = (
+            LockedLab(lab.filename, self.read_lab_json_static(lab.filename)) if filepath.exists() else None
+        )
         db_fields = {
             "name",
             "author",
@@ -710,32 +988,46 @@ class LabService:
         await self.db.commit()
         await self.db.refresh(lab)
 
-        if filepath.exists():
-            async with locked_lab_async(lab.filename) as locked:
-                for field in db_fields:
-                    if field in updates and updates[field] is not None:
-                        locked.data["meta"][field] = updates[field]
-                locked.save()
+        if lab_json is not None:
+            for field in db_fields:
+                if field in updates and updates[field] is not None:
+                    lab_json.data["meta"][field] = updates[field]
+            lab_json.save()
 
         return lab
 
-    async def delete_lab(self, lab: LabMeta) -> None:
-        filepath = _lab_file_path(lab.filename)
-        assert_no_external_members_for_scope(lab.filename)
-        if filepath.exists():
-            try:
-                data = LabService.read_lab_json_static(lab.filename)
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
-                logger.warning(
-                    "delete_lab: could not read %s for network cleanup (%s)",
-                    lab.filename,
-                    exc,
-                )
-            else:
-                _cleanup_lab_network_runtime(data, lab.filename)
-            await unlink_lab_file(lab.filename)
-        await self.db.delete(lab)
-        await self.db.commit()
+    async def delete_lab(self, lab: LabMeta, *, locked: bool = False) -> bool:
+        """Delete the lab and report cancellation received after mutation started."""
+        filename = lab.filename
+        if not locked:
+            async with lab_membership_lock(filename, ipam=True):
+                await self.db.refresh(lab)
+                if lab.filename != filename:
+                    raise FileNotFoundError(filename)
+                return await self.delete_lab(lab, locked=True)
+
+        cancelled = await self.delete_lab_file(filename)
+
+        async def delete_row() -> None:
+            await self.db.delete(lab)
+            await self.db.commit()
+
+        _, cancelled_during_commit = await wait_for_mutation(asyncio.create_task(delete_row()))
+        return cancelled or cancelled_during_commit
+
+    @classmethod
+    async def delete_lab_file(cls, filename: str) -> bool:
+        """Remove the file and owned runtime while the caller holds the membership lock."""
+        if not cls.file_exists(filename):
+            return False
+        try:
+            data = cls.read_lab_json_static(filename)
+        except (OSError, ValueError) as exc:
+            logger.warning("delete_lab: could not read %s for runtime cleanup (%s)", filename, exc)
+            await unlink_lab_file(filename, locked=True)
+            return False
+        _, cancelled = await run_mutation(_cleanup_and_unlink_lab, filename, data)
+        return cancelled
 
     @staticmethod
     def read_lab_json_static(filename: str) -> dict:

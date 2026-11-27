@@ -14,7 +14,9 @@ import pytest
 from app.routers import labs
 from app.services.guacamole_db_service import GuacamoleDatabaseService, _AUTH_TOKEN_CACHE
 from app.services.html5_service import Html5SessionService
+from app.services.lab_service import LabService
 from app.services.node_runtime_service import (
+    NodeRuntimeError,
     NodeRuntimeService,
     _merge_qemu_args,
     _parse_qemu_tokens,
@@ -116,6 +118,142 @@ def patched_settings(monkeypatch, runtime_settings):
     monkeypatch.setattr("app.services.node_runtime_service.get_settings", lambda: runtime_settings)
     monkeypatch.setattr("app.services.html5_service.get_settings", lambda: runtime_settings)
     return runtime_settings
+
+
+def test_planned_mac_persists_in_the_matching_nested_lab(patched_settings):
+    labs_dir = patched_settings.LABS_DIR
+    target = labs_dir / "team" / "nested" / "same.json"
+    sibling = labs_dir / "team" / "same.json"
+    root = labs_dir / "same.json"
+    target.parent.mkdir(parents=True)
+
+    def document(lab_id):
+        return {
+            "schema": 2,
+            "id": lab_id,
+            "meta": {"revision": 7},
+            "nodes": {"1": {"interfaces": [{"index": 0, "planned_mac": None}]}},
+            "networks": {},
+            "links": [],
+        }
+
+    for path, lab_id in ((root, "root-lab"), (sibling, "sibling-lab"), (target, "target-lab")):
+        path.write_text(json.dumps(document(lab_id)))
+    root_bytes, sibling_bytes = root.read_bytes(), sibling.read_bytes()
+
+    NodeRuntimeService()._persist_planned_mac_to_lab_json("target-lab", 1, 0, "02:00:00:00:00:01")
+
+    saved = LabService.read_lab_json_static("team/nested/same.json")
+    assert saved["nodes"]["1"]["interfaces"][0]["planned_mac"] == "02:00:00:00:00:01"
+    assert saved["meta"]["revision"] == 7
+    assert (root.read_bytes(), sibling.read_bytes()) == (root_bytes, sibling_bytes)
+
+
+_BAD_RECORD_MARKER = b"invalid-runtime-record-marker"
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        pytest.param(b'{"detail":"' + _BAD_RECORD_MARKER + b'"}', id="missing-identity"),
+        pytest.param(b'{"lab_id":"","node_id":1}', id="empty-lab-id"),
+        pytest.param(b'{"lab_id":"test-lab","node_id":true}', id="boolean-node-id"),
+        pytest.param(b'{"lab_id":"test-lab","node_id":1}', id="mismatched-filename"),
+        pytest.param(b'["' + _BAD_RECORD_MARKER + b'"]', id="non-dict"),
+        pytest.param(b'{"detail":"' + _BAD_RECORD_MARKER, id="invalid-json"),
+        pytest.param(b"\xff" + _BAD_RECORD_MARKER, id="invalid-utf8"),
+    ],
+)
+def test_malformed_runtime_records_do_not_block_eager_or_lazy_reads(
+    patched_settings, caplog, contents
+):
+    runtime_dir = patched_settings.TMP_DIR / "node-runtime"
+    runtime_dir.mkdir()
+    good = {"lab_id": "test-lab", "node_id": 1, "kind": "qemu"}
+    (runtime_dir / "test-lab-1.json").write_text(json.dumps(good))
+    eager_bad = runtime_dir / "test-lab-2.json"
+    eager_bad.write_bytes(contents)
+
+    service = NodeRuntimeService()
+    assert service._registry == {"test-lab:1": good}
+    assert service._runtime_record("test-lab", 1, include_stopped=True) == good
+    assert "test-lab-2.json" in caplog.text
+
+    lazy_bad = runtime_dir / "test-lab-3.json"
+    lazy_bad.write_bytes(contents)
+    assert service._runtime_record("test-lab", 3, include_stopped=True) is None
+    assert "test-lab-3.json" in caplog.text
+    assert _BAD_RECORD_MARKER.decode() not in caplog.text
+    assert eager_bad.read_bytes() == lazy_bad.read_bytes() == contents
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_field,admitted",
+    [
+        pytest.param({"pid": "invalid"}, False, id="pid"),
+        pytest.param({"pid_create_time": []}, False, id="create-time"),
+        pytest.param({"pid_create_time": float("nan")}, False, id="nonfinite-create-time"),
+        pytest.param({"pid_create_time": 10**400}, False, id="overflowing-create-time"),
+        pytest.param({"kind": {}}, False, id="kind"),
+        pytest.param({"kind": "docker", "container_name": []}, False, id="container-name"),
+        pytest.param({"pid": -1}, False, id="negative-pid"),
+        pytest.param({"kind": "docker", "container_name": "invalid\0name"}, False, id="nul-container-name"),
+        pytest.param({"pid": 123}, True, id="liveness-evaluation-error"),
+    ],
+)
+async def test_invalid_liveness_fields_do_not_disrupt_runtime_consumers(
+    patched_settings, sample_lab, monkeypatch, bad_field, admitted
+):
+    runtime_dir = patched_settings.TMP_DIR / "node-runtime"
+    runtime_dir.mkdir()
+    lab_id = sample_lab["id"]
+    bad = {"lab_id": lab_id, "node_id": 1, "kind": "qemu", **bad_field}
+    good = {"lab_id": lab_id, "node_id": 2, "kind": "qemu"}
+    bad_path = runtime_dir / f"{lab_id}-1.json"
+    bad_text = json.dumps(bad)
+    bad_path.write_text(bad_text)
+    (runtime_dir / f"{lab_id}-2.json").write_text(json.dumps(good))
+    sample_lab["nodes"]["2"] = {**sample_lab["nodes"]["1"], "id": 2, "status": 0}
+    lab_path = patched_settings.LABS_DIR / "sample.json"
+    lab_path.write_text(json.dumps(sample_lab))
+
+    def is_alive(record):
+        if record["node_id"] == bad["node_id"]:
+            raise ValueError("Invalid process data")
+        assert record == good
+        return True
+
+    async def publish(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(NodeRuntimeService, "_is_runtime_alive", staticmethod(is_alive))
+    monkeypatch.setattr(
+        NodeRuntimeService, "_check_alive_sync", staticmethod(lambda record, *_: is_alive(record))
+    )
+    monkeypatch.setattr("app.services.ws_hub.ws_hub.publish", publish)
+
+    service = NodeRuntimeService()
+    assert (f"{lab_id}:1" in service._registry) is admitted
+    assert service.runtime_counts()["qemu"] == 1
+    await NodeRuntimeService._run_heartbeat_cycle()
+    assert json.loads(lab_path.read_text())["nodes"]["2"]["status"] == 2
+    assert bad_path.read_text() == bad_text
+
+
+def test_malformed_runtime_state_blocks_start_and_stop(patched_settings, sample_lab, monkeypatch):
+    runtime_dir = patched_settings.TMP_DIR / "node-runtime"
+    runtime_dir.mkdir()
+    state_file = runtime_dir / f'{sample_lab["id"]}-1.json'
+    state_file.write_text("{}")
+    service = NodeRuntimeService()
+    monkeypatch.setattr(service, "_start_qemu_node", lambda *_: pytest.fail("Started a node"))
+    monkeypatch.setattr(service, "_stop_qemu_runtime", lambda *_: pytest.fail("Stopped a node"))
+
+    for operate in (service.start_node, service.stop_node):
+        with pytest.raises(NodeRuntimeError, match="Repair the malformed runtime state"):
+            operate(sample_lab, 1)
+    assert state_file.read_text() == "{}"
 
 
 def _fake_subprocess_run_factory(recorded_calls):
@@ -706,6 +844,128 @@ async def test_warm_auth_token_populates_cache_off_critical_path(monkeypatch, ru
 
 
 @pytest.mark.asyncio
+async def test_login_preflight_and_immediate_console_share_token_exchange(monkeypatch, runtime_settings):
+    from fastapi import Response
+    from unittest.mock import AsyncMock
+
+    from app.routers import auth
+    from app.schemas.auth import LoginRequest
+    from app.schemas.user import UserRead
+
+    service = GuacamoleDatabaseService.__new__(GuacamoleDatabaseService)
+    service.settings = runtime_settings
+    service.database_url = "postgresql://guacdb-test"
+    user = UserRead(username="fixture", name="Fixture", email="fixture@example.test")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    requests = []
+
+    async def enter_exchange(username, password):
+        if password != service._guacamole_password(user):
+            raise AssertionError("Incorrect fixture password material")
+        requests.append(username)
+        entered.set()
+        await release.wait()
+        return "fixture-guacamole-token"
+
+    monkeypatch.setattr(service, "_request_auth_token", enter_exchange)
+    monkeypatch.setattr(service, "_token_is_valid", AsyncMock(return_value=True))
+    monkeypatch.setattr(auth, "GuacamoleDatabaseService", lambda: service)
+    monkeypatch.setattr(auth, "AuthService", lambda _db: SimpleNamespace(
+        authenticate=AsyncMock(return_value=user), create_session=AsyncMock(return_value="fixture-session")
+    ))
+    monkeypatch.setattr(auth, "create_access_token", lambda **kwargs: "fixture-access-token")
+    monkeypatch.setattr(auth.audit_service, "record", AsyncMock())
+
+    original_tasks = asyncio.all_tasks()
+    try:
+        login = await asyncio.wait_for(auth.login(
+            LoginRequest(username=user.username, password="fixture-password"), Response(), db=None
+        ), timeout=2)
+        assert login["code"] == 200
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        password = service._guacamole_password(user)
+        console = asyncio.create_task(service._auth_token(user.username, password))
+        await asyncio.sleep(0)
+        release.set()
+        assert await asyncio.wait_for(console, timeout=2) == "fixture-guacamole-token"
+        assert await service._auth_token(user.username, password) == "fixture-guacamole-token"
+        assert requests == [user.username]
+    finally:
+        release.set()
+        await asyncio.gather(*(asyncio.all_tasks() - original_tasks), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_token_waiter_does_not_interrupt_concurrent_console(monkeypatch, runtime_settings):
+    service = GuacamoleDatabaseService.__new__(GuacamoleDatabaseService)
+    service.settings = runtime_settings
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def exchange(username, password):
+        calls.append(username)
+        started.set()
+        await release.wait()
+        return "fixture-token"
+
+    monkeypatch.setattr(service, "_request_auth_token", exchange)
+    first = asyncio.create_task(service._auth_token("fixture", "fixture-password"))
+    second = None
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        second = asyncio.create_task(service._auth_token("fixture", "fixture-password"))
+        await asyncio.sleep(0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        release.set()
+        assert await asyncio.wait_for(second, timeout=2) == "fixture-token"
+        assert calls == ["fixture"]
+    finally:
+        release.set()
+        await asyncio.gather(*(task for task in (first, second) if task is not None), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_foreground_token_exchange_recovers_from_failed_warmup(monkeypatch, runtime_settings):
+    from app.services.guacamole_db_service import GuacamoleDatabaseError
+
+    service = GuacamoleDatabaseService.__new__(GuacamoleDatabaseService)
+    service.settings = runtime_settings
+    service.database_url = "postgresql://guacdb-test"
+    started = asyncio.Event()
+    release = asyncio.Event()
+    requests = 0
+
+    async def exchange(username, password):
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            started.set()
+            await release.wait()
+            raise GuacamoleDatabaseError("Fixture account was not provisioned when warm-up began")
+        return "post-provision-token"
+
+    monkeypatch.setattr(service, "_request_auth_token", exchange)
+    prewarm = asyncio.create_task(service.warm_auth_token("fixture"))
+    foreground = []
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        password = service._token_password_for("fixture")
+        foreground = [asyncio.create_task(service._auth_token("fixture", password)) for _ in range(2)]
+        await asyncio.sleep(0)
+        assert requests == 1
+        release.set()
+        assert await asyncio.wait_for(asyncio.gather(*foreground), timeout=2) == ["post-provision-token"] * 2
+        assert requests == 2
+    finally:
+        release.set()
+        await asyncio.gather(prewarm, *foreground, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_warm_auth_token_swallows_failures(monkeypatch, runtime_settings):
     service = GuacamoleDatabaseService.__new__(GuacamoleDatabaseService)
     service.settings = runtime_settings
@@ -1119,6 +1379,8 @@ async def test_docker_runtime_stays_running_without_host_pid_visibility(monkeypa
             return SimpleNamespace(returncode=0, stdout="4321\n", stderr="")
         if args[:2] == ["inspect", "-f"] and args[2] == "{{.State.Running}}":
             return SimpleNamespace(returncode=0, stdout="true\n", stderr="")
+        if args[:2] == ["inspect", "-f"] and args[2] == "{{json .}}":
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"State": {"Running": True, "Pid": 4321}, "HostConfig": {"NetworkMode": "none"}}), stderr="")
         if args[0] in {"stop", "rm"}:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -1951,6 +2213,8 @@ def _us204_docker_run_factory(containers: dict[str, dict[str, object]]):
                     stdout=("true" if container["running"] else "false") + "\n",
                     stderr="",
                 )
+            if template == "{{json .}}":
+                return SimpleNamespace(returncode=0, stdout=json.dumps({"State": {"Running": container["running"], "Pid": container["pid"]}, "HostConfig": {"NetworkMode": "none"}}), stderr="")
             if template == "{{.Id}}":
                 return SimpleNamespace(
                     returncode=0,
@@ -2062,6 +2326,62 @@ def test_docker_start_reconciles_running_same_name_container(
 # ---------------------------------------------------------------------------
 # US-287: opt-in per-lab management attachment (mgmt0)
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("output,expected", [
+    ('{"State":{"Running":true,"Pid":123},"HostConfig":{"NetworkMode":"bridge"}}', "bridge"),
+    ('{"State":{"Running":true,"Pid":123},"HostConfig":{"NetworkMode":"none"}}', "none"),
+    ('{"State":{"Running":false}}', None),
+])
+def test_docker_network_state_inspects_host_mode(monkeypatch, patched_settings, output, expected):
+    monkeypatch.setattr(NodeRuntimeService, "_resolve_binary", lambda self, name: "docker")
+    calls = []
+    def inspect(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+    monkeypatch.setattr("app.services.node_runtime_service.subprocess.run", inspect)
+    state = NodeRuntimeService().docker_network_state("lab", 1)
+    assert (state["network_mode"] if state else None) == expected
+    assert calls[0][-1] == "nova-ve-lab-1"
+    assert all("State.Pid" not in arg for arg in calls[0])
+
+
+def test_docker_inspection_distinguishes_missing_from_errors(monkeypatch, patched_settings):
+    from app.services.node_runtime_service import NodeRuntimeError
+    monkeypatch.setattr(NodeRuntimeService, "_resolve_binary", lambda self, name: "docker")
+    service = NodeRuntimeService()
+    monkeypatch.setattr("app.services.node_runtime_service.subprocess.run", lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="Error: No such object: test"))
+    assert service.docker_network_state("lab", 1) is None
+    monkeypatch.setattr("app.services.node_runtime_service.subprocess.run", lambda *a, **k: SimpleNamespace(returncode=1, stdout="", stderr="Cannot connect to daemon"))
+    with pytest.raises(NodeRuntimeError, match="Could not inspect"):
+        service.docker_network_state("lab", 1)
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired("docker", 5)
+    monkeypatch.setattr("app.services.node_runtime_service.subprocess.run", timeout)
+    with pytest.raises(NodeRuntimeError, match="Could not inspect"):
+        service.docker_network_state("lab", 1)
+
+
+def test_unregistered_legacy_stop_does_not_mutate_candidate(monkeypatch, patched_settings):
+    from app.services.node_runtime_service import NodeRuntimeError
+    service = NodeRuntimeService()
+    monkeypatch.setattr(service, "_runtime_record", lambda *args, **kwargs: None)
+    monkeypatch.setattr(service, "docker_network_state", lambda *args, **kwargs: {"container_name": "nova-ve-lab-1", "network_mode": "bridge"})
+    monkeypatch.setattr(service, "_stop_docker_runtime", lambda *args: pytest.fail("must not stop unverified container"))
+    with pytest.raises(NodeRuntimeError, match="Verify its ownership"):
+        service.stop_node({"id": "lab", "nodes": {"1": {"id": 1, "name": "old", "type": "docker"}}}, 1)
+
+
+def test_legacy_container_is_not_adopted_or_given_a_proxy(monkeypatch, patched_settings):
+    from app.services.node_runtime_service import NodeRuntimeError
+    service = NodeRuntimeService()
+    monkeypatch.setattr(service, "_resolve_binary", lambda name: "docker")
+    monkeypatch.setattr(service, "_docker_container_running_by_name", lambda *args: True)
+    monkeypatch.setattr(service, "docker_network_state", lambda *args: {"container_name": "nova-ve-lab-1", "network_mode": "bridge", "pid": 456})
+    monkeypatch.setattr("app.services.node_runtime_service.runtime_pids.register", lambda *args: pytest.fail("must not register legacy container"))
+    monkeypatch.setattr("app.services.host_net.console_proxy_start", lambda **kwargs: pytest.fail("must not start proxy"))
+    lab = {"id": "lab", "nodes": {"1": {"id": 1, "name": "old", "type": "docker"}}}
+    with pytest.raises(NodeRuntimeError, match="legacy networking"):
+        service.start_node(lab, 1)
 
 
 def _us287_mgmt_lab() -> dict:
@@ -2292,6 +2612,149 @@ def test_docker_start_mgmt_attach_failure_rolls_back(
     # next start reuses its subnet — same lifecycle as network bridges.
 
 
+# #332: ids are never reused, so two nodes of a lab can fold to one mgmt0 octet
+
+
+def _us332_mgmt_lab(*node_ids: int) -> dict:
+    """Docker nodes with ``mgmt_access`` on, each with one interface on net 1."""
+    from app.services import host_net as host_net_module
+
+    bridge = host_net_module.bridge_name("lab-204", 1)
+    return {
+        "schema": 2,
+        "id": "lab-204",
+        "meta": {"name": "us332"},
+        "viewport": {"x": 0, "y": 0, "zoom": 1.0},
+        "nodes": {
+            str(node_id): {
+                "id": node_id,
+                "name": f"mgmt-{node_id}",
+                "type": "docker",
+                "image": "nova-ve/alpine-telnet:latest",
+                "console": "telnet",
+                "cpu": 1,
+                "ram": 256,
+                "ethernet": 1,
+                "extras": {"mgmt_access": "true"},
+                "interfaces": [
+                    {"index": 0, "name": "eth0", "planned_mac": None, "port_position": None},
+                ],
+            }
+            for node_id in node_ids
+        },
+        "networks": {
+            "1": {
+                "id": 1,
+                "name": "lab-link",
+                "type": "linux_bridge",
+                "visibility": True,
+                "implicit": False,
+                "config": {},
+                "runtime": {"bridge_name": bridge},
+            }
+        },
+        "links": [
+            {
+                "id": f"lnk_{index + 1:03d}",
+                "from": {"node_id": node_id, "interface_index": 0},
+                "to": {"network_id": 1},
+                "style_override": None,
+                "label": "",
+                "color": "",
+                "width": "1",
+                "metrics": {"delay_ms": 0, "loss_pct": 0, "bandwidth_kbps": 0, "jitter_ms": 0},
+            }
+            for index, node_id in enumerate(node_ids)
+        ],
+        "defaults": {"link_style": "orthogonal"},
+    }
+
+
+def _us332_mgmt_network() -> str:
+    """The /24 the mgmt bridge of ``lab-204`` is given on a host with no clash."""
+    from app.services import host_net as host_net_module
+
+    return f"172.16.{host_net_module.mgmt_subnet_candidates('lab-204')[0]}"
+
+
+def _us332_mgmt_start_io(monkeypatch, lab: dict, containers: dict) -> None:
+    """Everything a docker start touches; ``containers`` is the fake daemon."""
+    _us203_helper_mock(
+        monkeypatch, present_bridges={lab["networks"]["1"]["runtime"]["bridge_name"]}
+    )
+    _mock_runtime_binaries(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.node_runtime_service.host_net.sweep_node_host_ifaces",
+        lambda _lab_id, _node_id: None,
+    )
+    monkeypatch.setattr(
+        "app.services.node_runtime_service.host_net.console_proxy_start",
+        lambda **_kwargs: 8123,
+    )
+    monkeypatch.setattr(
+        "app.services.node_runtime_service.subprocess.run", _us204_docker_run_factory(containers)
+    )
+
+
+def test_mgmt_inventory_refuses_orphan_with_same_address(monkeypatch, patched_settings):
+    from app.services.node_runtime_service import NodeRuntimeError
+    service = NodeRuntimeService()
+    monkeypatch.setattr(service, "_resolve_binary", lambda _: "docker")
+    monkeypatch.setattr("app.services.node_runtime_service.subprocess.run", lambda *a, **k:
+                        SimpleNamespace(returncode=0, stdout="nova-ve-lab204-253\n", stderr=""))
+    with pytest.raises(NodeRuntimeError, match="management address"):
+        service._check_mgmt_address_available("lab-204", 3)
+    service._check_mgmt_address_available("lab-204", 4)
+
+
+def test_mgmt_inventory_failure_refuses_start(monkeypatch, patched_settings):
+    from app.services.node_runtime_service import NodeRuntimeError
+    service = NodeRuntimeService()
+    monkeypatch.setattr(service, "_resolve_binary", lambda _: "docker")
+    monkeypatch.setattr("app.services.node_runtime_service.subprocess.run", lambda *a, **k:
+                        SimpleNamespace(returncode=1, stdout="", stderr="unavailable"))
+    with pytest.raises(NodeRuntimeError, match="inspect running containers"):
+        service._check_mgmt_address_available("lab-204", 3)
+
+
+def test_management_starts_serialize_inventory_and_launch(monkeypatch, patched_settings, _us203_instance_id):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    service = NodeRuntimeService()
+    lab = _us332_mgmt_lab(3, 253)
+    for node in lab["nodes"].values():
+        node["interfaces"] = []
+    monkeypatch.setattr(service, "_runtime_record", lambda *a, **kw: None)
+    monkeypatch.setattr(service, "_reconcile_docker_node_runtime", lambda *a: None)
+    monkeypatch.setattr("app.services.node_runtime_service.host_net.sandbox_mode", lambda: False)
+    monkeypatch.setattr(service, "_persist_runtime", lambda *a: None)
+    first_entered = threading.Event()
+    release = threading.Event()
+    second_checked = threading.Event()
+    def check(_lab, node_id):
+        if node_id == 253:
+            second_checked.set()
+    def launch(_lab, node):
+        if node["id"] == 3:
+            first_entered.set()
+            assert release.wait(3)
+        return {"id": node["id"]}
+    monkeypatch.setattr(service, "_check_mgmt_address_available", check)
+    monkeypatch.setattr(service, "_start_docker_node", launch)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(service.start_node, lab, 3)
+        assert first_entered.wait(3)
+        second = pool.submit(service.start_node, lab, 253)
+        try:
+            assert not second_checked.wait(0.2)
+        finally:
+            release.set()
+        first.result(timeout=3)
+        second.result(timeout=3)
+    assert second_checked.is_set()
+
+
 def _us204_start_alpine_a(
     monkeypatch,
     patched_settings,
@@ -2518,8 +2981,10 @@ def test_us204_hot_attach_symmetric_with_initial_attach(monkeypatch, patched_set
 
 
 @pytest.mark.asyncio
-async def test_live_mac_endpoint_publishes_ws_event(monkeypatch, patched_settings):
-    lab_path = patched_settings.LABS_DIR / "live-mac.json"
+@pytest.mark.parametrize("lab_filename", ["live-mac.json", "team/project/live-mac.json"])
+async def test_live_mac_endpoint_publishes_ws_event(monkeypatch, patched_settings, lab_filename):
+    lab_path = patched_settings.LABS_DIR / lab_filename
+    lab_path.parent.mkdir(parents=True, exist_ok=True)
     lab_data = {
         "schema": 2,
         "id": "lab-live-qemu",
@@ -2552,13 +3017,10 @@ async def test_live_mac_endpoint_publishes_ws_event(monkeypatch, patched_setting
     }
     lab_path.write_text(json.dumps(lab_data))
 
-    captured: list[dict] = []
+    from app.services.ws_hub import WsHub
 
-    async def _capture_publish(lab_id, event_type, payload, rev=""):
-        captured.append({"lab_id": lab_id, "type": event_type, "payload": payload, "rev": rev})
-        return SimpleNamespace(seq=1, type=event_type, rev=rev, payload=payload)
-
-    monkeypatch.setattr("app.routers.labs.ws_hub.publish", _capture_publish)
+    hub = WsHub()
+    monkeypatch.setattr(labs, "ws_hub", hub)
 
     fixed_result = {
         "state": "confirmed",
@@ -2573,21 +3035,23 @@ async def test_live_mac_endpoint_publishes_ws_event(monkeypatch, patched_setting
     )
 
     response = await labs.get_interface_live_mac(
-        "live-mac.json",
+        lab_filename,
         1,
         0,
         current_user=SimpleNamespace(username="admin"),
     )
 
     assert response == fixed_result
-    assert len(captured) == 1
-    event = captured[0]
-    assert event["type"] == "interface_live_mac"
-    assert event["payload"]["node_id"] == 1
-    assert event["payload"]["interface_index"] == 0
-    assert event["payload"]["state"] == "confirmed"
-    assert event["payload"]["planned_mac"] == "aa:bb:cc:dd:ee:01"
-    assert event["payload"]["live_mac"] == "aa:bb:cc:dd:ee:01"
+    events, _ = hub.replay_since(lab_filename, 0, identity=lab_data["id"])
+    assert len(events) == 1
+    event = events[0]
+    assert event.rev == lab_data["id"]
+    assert event.type == "interface_live_mac"
+    assert event.payload["node_id"] == 1
+    assert event.payload["interface_index"] == 0
+    assert event.payload["state"] == "confirmed"
+    assert event.payload["planned_mac"] == "aa:bb:cc:dd:ee:01"
+    assert event.payload["live_mac"] == "aa:bb:cc:dd:ee:01"
 
 
 # ---------------------------------------------------------------------------
@@ -3301,6 +3765,82 @@ def test_merge_qemu_args_malformed_extra_raises_value_error():
 # The range no longer depends on EXTERNAL_CONSOLE_HOST; that setting gates
 # link advertisement only.
 # ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_concurrent_starts_reserve_primary_and_secondary_console_ports(monkeypatch, patched_settings):
+    from threading import Barrier
+
+    service = NodeRuntimeService()
+    barrier = Barrier(2, timeout=3)
+    monkeypatch.setattr("app.services.host_net.sandbox_mode", lambda: False)
+    monkeypatch.setattr("app.services.node_runtime_service._console_port_range", lambda mode: (19500, 19503))
+    monkeypatch.setattr(service, "_port_available", lambda port, bind_host: True)
+    monkeypatch.setattr(service, "_reconcile_docker_node_runtime", lambda *_: None)
+
+    def start_fixture(data, node):
+        primary = service._allocate_console_port("telnet")
+        secondary = service._allocate_console_port("vnc") if node["id"] == 1 else None
+        # Neither listener has bound yet, so an OS-only probe sees the same
+        # first port from either worker.
+        barrier.wait()
+        return {
+            "lab_id": data["id"], "node_id": node["id"], "kind": node["type"],
+            "console_port": primary, "second_console_port": secondary,
+        }
+
+    monkeypatch.setattr(service, "_start_qemu_node", start_fixture)
+    monkeypatch.setattr(service, "_start_docker_node", start_fixture)
+    lab = {"id": "fixture-console", "nodes": {"1": {"id": 1, "type": "qemu"}, "2": {"id": 2, "type": "docker"}}}
+
+    qemu, docker = await asyncio.gather(
+        asyncio.to_thread(service.start_node, lab, 1),
+        asyncio.to_thread(service.start_node, lab, 2),
+    )
+
+    assert sorted([qemu["console_port"], qemu["second_console_port"], docker["console_port"]]) == [19500, 19501, 19502]
+    assert service._allocate_console_port("telnet") == 19503
+
+
+def test_failed_start_releases_its_console_port_reservation(monkeypatch, patched_settings):
+    service = NodeRuntimeService()
+    chosen = []
+    monkeypatch.setattr("app.services.host_net.sandbox_mode", lambda: False)
+    monkeypatch.setattr("app.services.node_runtime_service._console_port_range", lambda mode: (19500, 19501))
+    monkeypatch.setattr(service, "_port_available", lambda port, bind_host: True)
+
+    def start_fixture(data, node):
+        port = service._allocate_console_port("telnet")
+        chosen.append(port)
+        if len(chosen) == 1:
+            raise NodeRuntimeError("fixture launch failed before binding")
+        return {"lab_id": data["id"], "node_id": node["id"], "kind": node["type"], "console_port": port}
+
+    monkeypatch.setattr(service, "_start_qemu_node", start_fixture)
+    lab = {"id": "fixture-console", "nodes": {"1": {"id": 1, "type": "qemu"}}}
+    with pytest.raises(NodeRuntimeError, match="fixture launch failed"):
+        service.start_node(lab, 1)
+    assert service.start_node(lab, 1)["console_port"] == 19500
+    assert chosen == [19500, 19500]
+
+
+def test_docker_adoption_reserves_both_ports_before_opening_either_proxy(monkeypatch, patched_settings):
+    service = NodeRuntimeService()
+    monkeypatch.setattr("app.services.node_runtime_service._console_port_range", lambda mode: (19500, 19500))
+    monkeypatch.setattr(service, "_port_available", lambda port, bind_host: True)
+    monkeypatch.setattr(service, "_resolve_binary", lambda *_: "/fixture/docker")
+    monkeypatch.setattr(service, "_docker_container_running_by_name", lambda *_: True)
+    monkeypatch.setattr(service, "docker_network_state", lambda *_: {"network_mode": "none", "pid": 123})
+    monkeypatch.setattr("app.services.runtime_pids.register", lambda *_: pytest.fail("unexpected PID registration"))
+    monkeypatch.setattr("app.services.host_net.console_proxy_start", lambda **_: pytest.fail("unexpected proxy"))
+    node = {"id": 1, "type": "docker", "console": "telnet", "second_console": "vnc"}
+    lab = {"id": "fixture-adopt", "nodes": {"1": node}}
+
+    with pytest.raises(NodeRuntimeError, match="No vnc console ports available"):
+        service.start_node(lab, 1)
+
+    assert service._allocate_console_port("telnet") == 19500
+    assert service._runtime_record("fixture-adopt", 1) is None
+
+
 def test_allocate_console_port_returns_range_start_per_mode(monkeypatch, patched_settings):
     probed = []
 

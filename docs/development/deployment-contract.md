@@ -63,9 +63,9 @@ Route ownership:
 
 ## Database Lifecycle Ownership
 
-- Migrations run as an explicit provisioning/deploy action via `deploy/scripts/run-migrations.sh`.
+- Migrations run as an explicit provisioning action as the service user. Operators can use `deploy/scripts/run-migrations.sh` for manual application deployments.
 - The backend service must **not** self-migrate on startup.
-- Initial seed runs as a separate explicit provisioning/deploy action via `deploy/scripts/run-seed.sh`.
+- Initial seed runs as a separate explicit provisioning action as the service user.
 - Seed is safe to rerun because it skips creation when the configured admin user already exists.
 - Guacamole schema bootstrap runs as an explicit provisioning/deploy action inside `deploy/scripts/run-guacamole.sh`.
 - Guacamole auth/storage uses PostgreSQL-backed datasource `postgresql`, not the legacy JSON-auth-only path, for the target host lane.
@@ -73,7 +73,8 @@ Route ownership:
 
 ## Filesystem Layout
 
-- App checkout root: the absolute repo path where `deploy/scripts/provision-ubuntu-2604.sh` is executed; installer default is `/var/lib/nova-ve/nova-ve-git`
+- App checkout root: the service-owned application directory. The installer defaults to `/var/lib/nova-ve/nova-ve-git`.
+- Privileged provisioning source: a temporary root-owned checkout at the same Git revision as the application. The installer removes it after provisioning.
 - **Instance ID file: `/etc/nova-ve/instance_id`** — written once by `provision-ubuntu-2604.sh`, never overwritten; authoritative source for bridge/TAP name derivation
 - Static frontend root: `/var/lib/nova-ve/www`
 - Labs: `/var/lib/nova-ve/labs`
@@ -96,7 +97,7 @@ The backend derives a 16-bit `lab_hash = blake2b(instance_id + ":" + lab_id, dig
 
 - `/etc/nova-ve/instance_id` **MUST NOT live on a shared filesystem** (NFS, CIFS, etc.).
   Each physical or virtual host must have a unique value on its local filesystem.
-- If a host VM is cloned from an image, `provision-ubuntu-2604.sh` must be re-run on the
+- If a host VM is cloned from an image, `install.sh` must be re-run on the
   clone so a new UUID is generated. The script is idempotent only within a single host
   (it never overwrites an existing non-empty file). Clones share the original UUID unless
   the file is explicitly regenerated.
@@ -133,6 +134,32 @@ them only when an operator has a specific reason to deviate.
 | --- | --- | --- | --- |
 | `NOVA_VE_DISCOVERY_CADENCE_SECONDS` | `30` | `[5, 300]` | Period of the discovery loop that walks each lab network's Linux bridge (`bridge link show master <bridge>`) plus container netns and cross-references against `links[]`. Discrepancies emit a `discovered_link` WS event consumed by the canvas overlay. Out-of-range values fail backend startup. Also editable in the UI (System → Settings); edits persist to `system-settings.json` and apply at the next backend restart (`systemctl restart nova-ve-backend.service` — the unit has no reload action). |
 | `NOVA_VE_NAT_CLOUD_POOL` | `10.255.0.0/16` | IPv4 CIDR, prefix `/0`-`/24` | Root pool for auto-allocating one `/24` per NAT-Cloud network. |
+| `NOVA_VE_KSM_PAGES_TO_SCAN` | `1250` | positive int | KSM scanner pages per wake (see below). |
+| `NOVA_VE_KSM_SLEEP_MS` | `10` | positive int | KSM scanner sleep between wakes, in milliseconds (see below). |
+| `NOVA_VE_KSM_RUN` | `1` | `0` or `1` | Master KSM switch (see below). |
+
+## Kernel Samepage Merging (KSM)
+
+Running labs are the ideal case for KSM: many guests boot the same images, so
+identical guest pages can be deduplicated instead of each guest paying a
+private copy. Stock Ubuntu ships the daemon off, so provisioning turns it on.
+
+- QEMU marks guest RAM mergeable itself; no node or template change is needed.
+  Guests started before KSM was enabled deduplicate once the daemon runs, so
+  no restart is required for existing nodes to benefit.
+- `provision-ubuntu-2604.sh` persists `KSM_ENABLED=1` in
+  `/etc/default/qemu-kvm` (otherwise the stock boot task forces `run=0` again
+  at every boot), installs `/opt/nova-ve/bin/nova-ve-ksm.sh` with the
+  `nova-ve-ksm.service` boot unit (tuned scanner rates, `run` set last,
+  `ksmtuned` masked so nothing else toggles KSM), and enables the unit after
+  `qemu-kvm.service` and before `nova-ve-backend.service`.
+- The `NOVA_VE_KSM_*` overrides above are read from
+  `/etc/nova-ve/nova-ve.env` by the tuner script. Remove the overrides (or set
+  `NOVA_VE_KSM_RUN=0`) and restart `nova-ve-ksm.service` to turn KSM back off.
+- `/api/status` reports the live state in `ksm` plus `ksm_facts`
+  (`enabled`, `pages_sharing`/`pages_shared`, `dedup_ratio`, `saved_gb`).
+  `smoke-check.sh` fails when the KSM interface exists but the daemon is not
+  scanning.
 
 ## Health And Smoke Checks
 

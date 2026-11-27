@@ -20,15 +20,19 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends
 
+from app.services.lab_paths import iter_lab_json_files
 from app.dependencies import get_current_user
 from app.openapi import COMMON_RESPONSES
 from app.schemas.user import UserRead
 from app.services import audit_service
+from app.services.async_utils import notify_after_mutation, run_mutation
 from app.services.lab_lock import LabLockTimeout, lab_lock
 from app.services.lab_service import LabService
 from app.services.node_runtime_service import NodeRuntimeService
@@ -74,6 +78,44 @@ def _user_folder_root(current_user: UserRead) -> str:
     if getattr(current_user, "role", "admin") == "admin":
         return ""
     return str(getattr(current_user, "folder", "/") or "/").replace("\\", "/").strip("/")
+
+
+def _lab_disk_bytes(lab_id: str) -> int | None:
+    """Allocated bytes in lab runtime files, excluding shared images and symlinks.
+
+    Missing work directories mean zero usage; an invalid id or an unreadable
+    directory yields an unknown value rather than an inaccurate partial sum.
+    """
+    from app.config import get_settings
+
+    if not lab_id or lab_id in {".", "..", "node-runtime"} or any(c in lab_id for c in "/\\\0"):
+        return None
+    root = get_settings().TMP_DIR / lab_id
+    try:
+        root_stat = root.lstat()
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
+    if not stat.S_ISDIR(root_stat.st_mode):
+        return None
+
+    def fail(error: OSError) -> None:
+        raise error
+
+    total = 0
+    seen: set[tuple[int, int]] = set()
+    try:
+        for directory, _, files in os.walk(root, followlinks=False, onerror=fail):
+            for name in files:
+                info = (Path(directory) / name).lstat()
+                if stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) not in seen:
+                    seen.add((info.st_dev, info.st_ino))
+                    total += info.st_blocks * 512
+    except OSError:
+        _logger.warning("Could not measure lab disk usage", exc_info=True)
+        return None
+    return total
 
 
 def _summarize_lab(lab_file: Path, labs_dir: Path, runtime: NodeRuntimeService | None = None) -> dict[str, Any] | None:
@@ -125,12 +167,13 @@ def _summarize_lab(lab_file: Path, labs_dir: Path, runtime: NodeRuntimeService |
         "nodes_running": running,
         "cpu_allocated": cpu_alloc,
         "ram_allocated_mb": ram_alloc,
+        "disk_bytes": _lab_disk_bytes(lab_id),
         "lock": bool(meta.get("lock")),
     }
 
 
 @router.get("")
-async def list_managed_labs(
+def list_managed_labs(
     current_user: UserRead = Depends(get_current_user),
 ):
     """Every lab instance with state and allocated resources.
@@ -144,11 +187,12 @@ async def list_managed_labs(
 
     labs: list[dict[str, Any]] = []
     if labs_dir.exists():
-        for lab_file in sorted(labs_dir.rglob("*.json")):
+        for lab_file in sorted(iter_lab_json_files(labs_dir)):
+            relative = lab_file.relative_to(labs_dir).as_posix()
+            if root and not relative.startswith(f"{root}/"):
+                continue
             summary = _summarize_lab(lab_file, labs_dir, runtime)
             if summary is None:
-                continue
-            if root and not summary["path"].lstrip("/").startswith(f"{root}/"):
                 continue
             labs.append(summary)
 
@@ -159,6 +203,7 @@ async def list_managed_labs(
         "nodes_running": sum(lab["nodes_running"] for lab in labs),
         "cpu_allocated": sum(lab["cpu_allocated"] for lab in labs),
         "ram_allocated_mb": sum(lab["ram_allocated_mb"] for lab in labs),
+        "disk_bytes": sum(lab["disk_bytes"] for lab in labs) if all(lab["disk_bytes"] is not None for lab in labs) else None,
     }
     return _ok("Managed labs listed.", {"labs": labs, "totals": totals})
 
@@ -183,7 +228,7 @@ def _stop_or_wipe(lab_path: str, wipe: bool) -> dict:
     wiped: list[int] = []
     failed: list[dict[str, Any]] = []
     try:
-        with lab_lock(lab_file.relative_to(labs_dir).as_posix(), labs_dir):
+        with lab_lock(lab_file.relative_to(labs_dir).as_posix(), labs_dir, create_parent=False):
             data = LabService.read_lab_json_static(
                 lab_file.relative_to(labs_dir).as_posix()
             )
@@ -252,14 +297,21 @@ async def _audit_lab_action(event: str, result: dict, current_user: UserRead) ->
     return result
 
 
+async def _lab_action(event: str, lab_path: str, wipe: bool, current_user: UserRead) -> dict:
+    if current_user.role != "admin":
+        return _fail("Admin role required.", code=403)
+    # #331: the action waits for the lab lock and stops every node, both of
+    # which block, so it runs in a worker thread rather than on the event loop.
+    result, cancelled = await run_mutation(_stop_or_wipe, lab_path, wipe=wipe)
+    return await notify_after_mutation(_audit_lab_action(event, result, current_user), cancelled)
+
+
 @router.post("/{lab_path:path}/stop")
 async def stop_lab(
     lab_path: str,
     current_user: UserRead = Depends(get_current_user),
 ):
-    if current_user.role != "admin":
-        return _fail("Admin role required.", code=403)
-    return await _audit_lab_action("lab.stop", _stop_or_wipe(lab_path, wipe=False), current_user)
+    return await _lab_action("lab.stop", lab_path, False, current_user)
 
 
 @router.post("/{lab_path:path}/wipe")
@@ -267,9 +319,7 @@ async def wipe_lab(
     lab_path: str,
     current_user: UserRead = Depends(get_current_user),
 ):
-    if current_user.role != "admin":
-        return _fail("Admin role required.", code=403)
-    return await _audit_lab_action("lab.wipe", _stop_or_wipe(lab_path, wipe=True), current_user)
+    return await _lab_action("lab.wipe", lab_path, True, current_user)
 
 
 # ----------------------------------------------------------------------
@@ -305,7 +355,7 @@ async def list_managed_nodes(
 
     rows: list[dict[str, Any]] = []
     if labs_dir.exists():
-        for lab_file in sorted(labs_dir.rglob("*.json")):
+        for lab_file in sorted(iter_lab_json_files(labs_dir)):
             try:
                 data = json.loads(lab_file.read_text())
             except (OSError, json.JSONDecodeError):

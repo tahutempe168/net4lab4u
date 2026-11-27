@@ -337,6 +337,33 @@ async def test_opening_either_lab_restores_bridge_as_owner(settings, host, labs_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("marker_missing", [False, True], ids=["verified-owner", "unverified-owner"])
+async def test_member_first_reconcile_repairs_stale_nat_owner_address(
+    settings, host, labs_dir, monkeypatch, marker_missing,
+):
+    svc, _owner, member, owned, _joined = await _pair(labs_dir, net_type="nat_cloud")
+    bridge = owned["runtime"]["bridge_name"]
+    stale = "10.42.0.1/24"
+    gateway = f"{owned['config']['gateway']}/24"
+    addresses = {(bridge, stale)}
+    if marker_missing:
+        host_net.bridge_fingerprint_remove(bridge)
+    monkeypatch.setattr(host_net, "list_ipv4_addrs", lambda: sorted(addresses))
+    monkeypatch.setattr(host_net, "bridge_addr_add", lambda name, cidr: addresses.add((name, cidr)))
+    monkeypatch.setattr(host_net, "bridge_addr_del", lambda name, cidr: addresses.remove((name, cidr)))
+
+    summary = svc.ensure_lab_bridges(member)
+
+    if marker_missing:
+        assert len(summary["skipped"]) == 1
+        assert addresses == {(bridge, stale)}
+        assert host_net.bridge_fingerprint_check(bridge, OWNER_ID, 1) == "absent"
+    else:
+        assert summary["skipped"] == []
+        assert addresses == {(bridge, gateway)}
+
+
+@pytest.mark.asyncio
 async def test_reconcile_skips_member_once_owner_stops_sharing(settings, host, labs_dir):
     svc, owner, member, _owned, _joined = await _pair(labs_dir)
     _edit(labs_dir, owner, lambda d: d["networks"]["1"].update(shared=False))
@@ -413,14 +440,15 @@ async def test_create_cannot_forge_membership(settings, host, labs_dir):
     await svc.delete_network(forger, blank["id"])
     assert host.deleted == [blank["runtime"]["bridge_name"]]
 
-    # Junk already stored by an older release stays inert.
-    await svc.create_network(forger, {"name": "junk"})
-    _edit(labs_dir, forger, lambda d: d["networks"]["1"]["config"].update(
+    # Junk already stored by an older release stays inert. Ids are never
+    # reused (#332), so the network is addressed by the id the create returned.
+    junk = await svc.create_network(forger, {"name": "junk"})
+    _edit(labs_dir, forger, lambda d: d["networks"][str(junk["id"])]["config"].update(
         shared_cloud_id=f"nat-cloud:{OWNER_ID}:1"))
-    info = build_network_info(forger, 1, lambda path: path == forger)
+    info = build_network_info(forger, junk["id"], lambda path: path == forger)
     assert info["sharing"]["role"] == "none" and info["sharing"]["labs"] == []
     with pytest.raises(NetworkServiceError):
-        await svc.patch_network(forger, 1, {"type": "nat_cloud"})
+        await svc.patch_network(forger, junk["id"], {"type": "nat_cloud"})
     await svc.delete_network(owner, 1)
 
     # Once shared, the id form works for everyone; admins may reuse any NAT-Cloud.
@@ -734,8 +762,11 @@ async def test_info_names_docker_nodes_from_learned_macs(settings, labs_dir, mon
         network_info_service.subprocess, "run",
         lambda *a, **k: SimpleNamespace(returncode=0, stdout=output),
     )
+    # Pre-#334 layout: a server started before the upgrade keeps its config
+    # and leases in the data directory, and the info panel still reads them.
     root = labs_dir.parent / "nat-cloud" / bridge
     root.mkdir(parents=True)
+    (root / "dnsmasq.conf").write_text("port=0\ndhcp-range=10.255.0.100,10.255.0.254,12h\n")
     (root / "leases").write_text("0 aa:00:00:00:00:01 10.255.0.101 * *\n0 aa:00:00:00:00:03 10.255.0.102 * *\n")
 
     info = build_network_info(lab, 1, lambda path: True)
@@ -744,6 +775,35 @@ async def test_info_names_docker_nodes_from_learned_macs(settings, labs_dir, mon
     ]
     assert [l["node_name"] for l in info["ip"]["dhcp"]["leases"]] == ["host-1", "host-2"]
     assert all("_ports" not in e for e in info["endpoints"])
+
+
+@pytest.mark.asyncio
+async def test_info_reads_new_dnsmasq_tree_before_the_legacy_one(settings, labs_dir, monkeypatch, tmp_path):
+    """#334: the info panel follows the server into the root-owned /run tree."""
+    svc = NetworkService()
+    lab = _lab(labs_dir, "nat.json", "lab-nat", nodes={"1": _node("50:00:00:01:00:00")}, links=LINK)
+    bridge = (await svc.create_network(lab, {"name": "inet", "type": "nat_cloud"}))["runtime"]["bridge_name"]
+    monkeypatch.setattr(network_info_service, "DNSMASQ_ROOT", tmp_path / "run" / "dnsmasq")
+    legacy = labs_dir.parent / "nat-cloud" / bridge
+    current = tmp_path / "run" / "dnsmasq" / bridge
+
+    def seed(root, conf, leases):
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "dnsmasq.conf").write_text(conf)
+        (root / "leases").write_text(leases)
+
+    def dhcp():
+        return build_network_info(lab, 1, lambda path: True)["ip"]["dhcp"]
+
+    # Right after the upgrade the server still runs from the legacy config.
+    seed(legacy, "port=0\ndhcp-range=10.255.0.100,10.255.0.254,12h\n", "0 50:00:00:01:00:00 10.255.0.140 r1 *\n")
+    assert [(l["ip"], l["node_name"]) for l in dhcp()["leases"]] == [("10.255.0.140", "r1")]
+    assert dhcp()["lease_time"] == "12h"
+
+    # The helper's restart leaves the legacy files behind; they no longer count.
+    seed(current, "port=0\ndhcp-range=10.255.0.100,10.255.0.254,24h\n", "")
+    assert dhcp()["leases"] == []
+    assert dhcp()["lease_time"] == "24h"
 
 
 @pytest.mark.asyncio
